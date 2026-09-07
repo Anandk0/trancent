@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.pytest_cache/
+
+# Virtual environments / local environments
+venv/
+.venv/
+env/
+ENV/
+gemma4-agent/
+indic-stt/
+parler-tts/
+
+# Model files / caches
+.cache/
+.ollama/
+.nv/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Audio / generated files
+*.wav
+*.mp3
+*.flac
+*.ogg
+/tmp/
+
+# Credentials / local configuration
+.aws/
+.env
+.env.*
+*.pem
+*.key
+
+# Jupyter / local configuration
+.ipynb_checkpoints/
+.streamlit/
+.config/
+.local/
+.conda/
+
+# Shell / history
+.bash_history
+.python_history
+.wget-hsts
+.gitconfig
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+
+# Temporary files
+-of
+test_permission.txt
+.bashrc

@@ -1,0 +1,29 @@
+# Core
+torch>=2.4.0
+torchaudio>=2.4.0
+
+# Parler-TTS
+transformers==4.46.1
+sentencepiece
+protobuf>=4.0.0,<5.0.0
+
+# Audio codec
+descript-audio-codec
+descript-audiotools-unofficial==0.7.4
+
+# Hugging Face
+huggingface_hub==0.36.2
+safetensors
+accelerate
+
+# Audio / numerical
+soundfile
+numpy
+scipy
+librosa
+
+# Utilities
+requests
+tqdm
+pyyaml
+packaging

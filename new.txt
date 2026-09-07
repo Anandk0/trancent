@@ -1,0 +1,7 @@
+torch
+transformers==5.16.1
+accelerate
+safetensors
+sentencepiece
+protobuf
+streamlit

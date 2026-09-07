@@ -1,0 +1,3 @@
+conda activate indic_parler
+python test_rani.py
+conda deactivate
