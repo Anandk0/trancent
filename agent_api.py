@@ -1,3 +1,4 @@
+import time
 import requests
 import uuid
 
@@ -37,7 +38,8 @@ def health():
 # HINGLISH → DEVANAGARI TTS NORMALIZER
 # ============================================================
 
-def normalize_for_tts(text: str) -> str:
+def normalize_for_tts(text: str) -> tuple:
+    """Returns (normalized_text, elapsed_seconds)."""
 
     prompt = f"""
 Convert the following conversational Hinglish/Hindi text into
@@ -119,6 +121,8 @@ TEXT TO CONVERT:
 {text}
 """
 
+    t0 = time.perf_counter()
+
     try:
 
         response = requests.post(
@@ -139,18 +143,21 @@ TEXT TO CONVERT:
 
         normalized_text = result.get("reply", "").strip()
 
-        if normalized_text:
-            return normalized_text
+        elapsed = time.perf_counter() - t0
 
-        return text
+        if normalized_text:
+            return normalized_text, elapsed
+
+        return text, elapsed
 
     except Exception as e:
 
+        elapsed = time.perf_counter() - t0
         print("TTS normalization error:", e)
 
         # Do not break the complete conversation if
         # normalization fails.
-        return text
+        return text, elapsed
 
 
 # ============================================================
@@ -171,6 +178,8 @@ async def chat(
     if not session_id:
         session_id = str(uuid.uuid4())
 
+    t_request_start = time.perf_counter()
+
     print("\n")
     print("=" * 60)
     print("NEW CHAT REQUEST")
@@ -184,7 +193,12 @@ async def chat(
 
     print("\n[1/4] Sending audio to ASR...")
 
+    t_read_start = time.perf_counter()
     audio_data = await file.read()
+    t_read_elapsed = time.perf_counter() - t_read_start
+    print(f"[TIMING] AUDIO_READ: {t_read_elapsed:.3f}s  ({len(audio_data)} bytes)")
+
+    t_asr_start = time.perf_counter()
 
     try:
 
@@ -221,6 +235,9 @@ async def chat(
             }
         )
 
+    t_asr_elapsed = time.perf_counter() - t_asr_start
+    print(f"[TIMING] ASR: {t_asr_elapsed:.3f}s")
+
 
     transcript = asr_result.get("text", "").strip()
 
@@ -246,6 +263,8 @@ async def chat(
     # ========================================================
 
     print("\n[2/4] Sending transcript to Gemma...")
+
+    t_gemma_start = time.perf_counter()
 
     try:
 
@@ -276,6 +295,8 @@ async def chat(
             }
         )
 
+    t_gemma_elapsed = time.perf_counter() - t_gemma_start
+    print(f"[TIMING] GEMMA: {t_gemma_elapsed:.3f}s")
 
     reply = gemma_result.get("reply", "").strip()
 
@@ -289,7 +310,8 @@ async def chat(
 
     print("\n[3/4] Converting response for TTS...")
 
-    tts_text = normalize_for_tts(reply)
+    tts_text, t_norm_elapsed = normalize_for_tts(reply)
+    print(f"[TIMING] TTS_NORMALIZATION: {t_norm_elapsed:.3f}s")
 
     print("TTS text:")
     print(tts_text)
@@ -300,6 +322,8 @@ async def chat(
     # ========================================================
 
     print("\n[4/4] Sending text to Parler TTS...")
+
+    t_tts_start = time.perf_counter()
 
     try:
 
@@ -332,14 +356,24 @@ async def chat(
             }
         )
 
+    t_tts_elapsed = time.perf_counter() - t_tts_start
+    print(f"[TIMING] TTS: {t_tts_elapsed:.3f}s")
 
     audio_file = tts_result.get("audio_file")
 
     print("Audio file:", audio_file)
 
+    t_total = time.perf_counter() - t_request_start
+
     print("\n")
     print("=" * 60)
     print("REQUEST COMPLETE")
+    print(f"[TIMING] AUDIO_READ:        {t_read_elapsed:.3f}s")
+    print(f"[TIMING] ASR:               {t_asr_elapsed:.3f}s")
+    print(f"[TIMING] GEMMA:             {t_gemma_elapsed:.3f}s")
+    print(f"[TIMING] TTS_NORMALIZATION: {t_norm_elapsed:.3f}s")
+    print(f"[TIMING] TTS:               {t_tts_elapsed:.3f}s")
+    print(f"[TIMING] AGENT_TOTAL:       {t_total:.3f}s")
     print("=" * 60)
 
 
