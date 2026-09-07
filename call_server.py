@@ -315,7 +315,7 @@ async function sendAudio(blob) {
 
   try {
     const arrayBuf = await blob.arrayBuffer();
-    const response = await fetch("/process", {
+    const response = await fetch("process", {
       method: "POST",
       headers: {
         "Content-Type": "audio/webm",
