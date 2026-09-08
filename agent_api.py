@@ -1,3 +1,5 @@
+import re
+import json
 import time
 import requests
 import uuid
@@ -35,129 +37,128 @@ def health():
 
 
 # ============================================================
-# HINGLISH → DEVANAGARI TTS NORMALIZER
+# STRUCTURED GEMMA PROMPT
 # ============================================================
 
-def normalize_for_tts(text: str) -> tuple:
-    """Returns (normalized_text, elapsed_seconds)."""
+# Wraps the user transcript so that one Gemma call returns both
+# the conversational reply and the Devanagari TTS text.
+#
+# The outer instruction is kept minimal so it does not inflate
+# the prompt or confuse the counselor persona.
 
-    prompt = f"""
-Convert the following conversational Hinglish/Hindi text into
-Devanagari script so that a Hindi text-to-speech model can pronounce
-it naturally.
+def build_structured_prompt(transcript: str) -> str:
+    return f"""Respond as the MBA admissions counselor.
 
-IMPORTANT RULES:
+Reply to the student's message below.
 
-1. Preserve the exact meaning.
-2. Do NOT add information.
-3. Do NOT remove information.
-4. Do NOT answer or respond to the text.
-5. Only convert the supplied text.
-6. If the text is Hindi or Hinglish, write the ENTIRE response
-   in Devanagari script.
-7. Romanized Hindi words must be converted to natural Devanagari.
-8. English words that are being spoken as part of Hindi/Hinglish
-   must also be written phonetically in Devanagari.
-9. Do NOT leave English words in Latin/Roman letters when converting
-   Hindi/Hinglish.
-10. Preserve abbreviations phonetically.
+Return your response as a single JSON object with exactly two keys:
+- "reply": your natural conversational response (same language style as the student)
+- "tts_text": the same response written entirely in Devanagari script for a Hindi TTS system
 
-Examples:
+Rules for tts_text:
+- If the reply is Hindi or Hinglish, write the ENTIRE tts_text in Devanagari.
+- Romanized Hindi words must be converted to natural Devanagari.
+- English professional terms spoken in a Hindi/Hinglish context must be written phonetically in Devanagari.
+- Do NOT leave English words in Latin letters inside tts_text when the reply is Hindi/Hinglish.
+- If the reply is fully in English, tts_text may remain in English.
+- Do NOT add punctuation around individual English-derived Devanagari words.
+- Preserve natural sentence flow so the TTS sounds like a real phone call.
 
-MBA → एमबीए
-HR → एचआर
-
-Finance → फाइनेंस
-Marketing → मार्केटिंग
-Placement → प्लेसमेंट
-Admission → एडमिशन
-Specialization → स्पेशलाइज़ेशन
+Examples of phonetic Devanagari for common terms:
+MBA → एमबीए, HR → एचआर, Finance → फाइनेंस, Marketing → मार्केटिंग,
+Placement → प्लेसमेंट, Admission → एडमिशन, Specialization → स्पेशलाइज़ेशन,
 Business Analytics → बिज़नेस एनालिटिक्स
-Help → हेल्प
-Interest → इंटरेस्ट
-Relax → रिलैक्स
 
-11. Do NOT translate these professional terms into formal Hindi.
-12. Preserve names in a pronounceable Devanagari form.
-13. Preserve the original meaning and sentence structure.
-14. Preserve punctuation where it represents a natural pause.
-15. Do NOT add punctuation around individual English-derived words.
-16. English-derived words written in Devanagari must flow naturally
-    with the surrounding Hindi sentence.
-17. Do not create pauses around individual English-derived words.
-18. Keep connected phrases together so the TTS speaks naturally.
-19. Return ONLY the converted Devanagari text.
-20. Do not include explanations.
-21. Do not include quotation marks.
+Return ONLY the JSON object. No markdown. No code fences. No explanation.
 
-Example:
+Example output:
+{{"reply": "Haan, MBA ka duration do saal ka hai.", "tts_text": "हाँ, एमबीए का ड्यूरेशन दो साल का है।"}}
 
-Input:
-Haan sir, MBA ka duration do saal ka hai.
+Student message:
+{transcript}"""
 
-Output:
-हाँ सर, एमबीए का ड्यूरेशन दो साल का है।
 
-Input:
-Aapko Finance specialization mein interest hai?
+# ============================================================
+# PARSE GEMMA STRUCTURED RESPONSE
+# ============================================================
 
-Output:
-आपको फाइनेंस स्पेशलाइज़ेशन में इंटरेस्ट है?
+def parse_gemma_json(raw: str, fallback_reply: str = "") -> tuple:
+    """
+    Parse the JSON object from Gemma's raw output.
 
-Input:
-Placement ke baare mein jaana hai?
+    Returns (reply, tts_text).
 
-Output:
-प्लेसमेंट के बारे में जानना है?
+    Handles:
+    - Clean JSON
+    - JSON wrapped in markdown code fences (with or without surrounding text)
+    - Partial/malformed JSON where only reply is present
 
-Input:
-Business Analytics mein interest hai kya?
+    Fallback (no second Gemma call):
+    - If tts_text is missing, use reply as tts_text.
+    - If reply is missing, use fallback_reply.
+    - Never raises; always returns two strings.
+    """
+    if not raw or not raw.strip():
+        return fallback_reply, fallback_reply
 
-Output:
-बिज़नेस एनालिटिक्स में इंटरेस्ट है क्या?
+    text = raw.strip()
+    candidates = [text]
 
-TEXT TO CONVERT:
+    # If wrapped in markdown code fences anywhere in text
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    if fence_match:
+        candidates.insert(0, fence_match.group(1).strip())
 
-{text}
-"""
+    # If there's an explicit JSON object {...} in text
+    brace_match = re.search(r"(\{[\s\S]*\})", text)
+    if brace_match:
+        candidates.insert(0, brace_match.group(1).strip())
 
-    t0 = time.perf_counter()
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                reply = str(data.get("reply", "") or "").strip()
+                tts_text = str(data.get("tts_text", "") or "").strip()
 
-    try:
+                if not reply and not tts_text:
+                    continue
 
-        response = requests.post(
-            GEMMA_URL,
-            json={
-                # IMPORTANT:
-                # Use a separate session so the TTS conversion
-                # does not become part of the counselor's memory.
-                "session_id": "tts-normalizer-" + str(uuid.uuid4()),
-                "text": prompt
-            },
-            timeout=120
-        )
+                if not reply:
+                    reply = fallback_reply
+                if not tts_text:
+                    tts_text = reply
 
-        response.raise_for_status()
+                return reply, tts_text
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
 
-        result = response.json()
+    # JSON parse failed — try regex extraction for "reply" and "tts_text"
+    reply_match = re.search(r'"reply"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+    tts_match = re.search(r'"tts_text"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
 
-        normalized_text = result.get("reply", "").strip()
+    reply = ""
+    tts_text = ""
 
-        elapsed = time.perf_counter() - t0
+    if reply_match:
+        reply = reply_match.group(1).replace('\\"', '"').replace('\\n', ' ').strip()
 
-        if normalized_text:
-            return normalized_text, elapsed
+    if tts_match:
+        tts_text = tts_match.group(1).replace('\\"', '"').replace('\\n', ' ').strip()
 
-        return text, elapsed
+    if reply or tts_text:
+        if not reply:
+            reply = fallback_reply
+        if not tts_text:
+            tts_text = reply
+        print("[WARN] JSON parse failed; extracted fields via regex.")
+        return reply, tts_text
 
-    except Exception as e:
-
-        elapsed = time.perf_counter() - t0
-        print("TTS normalization error:", e)
-
-        # Do not break the complete conversation if
-        # normalization fails.
-        return text, elapsed
+    # Complete parse failure — return the raw text as both fields
+    # so the call does not crash.
+    reply = text or fallback_reply
+    print("[WARN] JSON parse completely failed; using raw Gemma output as reply and tts_text.")
+    return reply, reply
 
 
 # ============================================================
@@ -191,7 +192,7 @@ async def chat(
     # 1. AUDIO → ASR
     # ========================================================
 
-    print("\n[1/4] Sending audio to ASR...")
+    print("\n[1/3] Sending audio to ASR...")
 
     t_read_start = time.perf_counter()
     audio_data = await file.read()
@@ -238,7 +239,6 @@ async def chat(
     t_asr_elapsed = time.perf_counter() - t_asr_start
     print(f"[TIMING] ASR: {t_asr_elapsed:.3f}s")
 
-
     transcript = asr_result.get("text", "").strip()
 
     print("ASR transcript:", transcript)
@@ -259,10 +259,12 @@ async def chat(
 
 
     # ========================================================
-    # 2. TRANSCRIPT → GEMMA COUNSELOR
+    # 2. TRANSCRIPT → GEMMA (single call, structured output)
     # ========================================================
 
-    print("\n[2/4] Sending transcript to Gemma...")
+    print("\n[2/3] Sending transcript to Gemma...")
+
+    structured_prompt = build_structured_prompt(transcript)
 
     t_gemma_start = time.perf_counter()
 
@@ -272,7 +274,7 @@ async def chat(
             GEMMA_URL,
             json={
                 "session_id": session_id,
-                "text": transcript
+                "text": structured_prompt
             },
             timeout=120
         )
@@ -298,30 +300,22 @@ async def chat(
     t_gemma_elapsed = time.perf_counter() - t_gemma_start
     print(f"[TIMING] GEMMA: {t_gemma_elapsed:.3f}s")
 
-    reply = gemma_result.get("reply", "").strip()
+    raw_gemma = gemma_result.get("reply", "").strip()
 
-    print("Gemma reply:")
-    print(reply)
+    print("Gemma raw output:")
+    print(raw_gemma)
 
+    reply, tts_text = parse_gemma_json(raw_gemma, fallback_reply=transcript)
 
-    # ========================================================
-    # 3. HINGLISH → DEVANAGARI
-    # ========================================================
-
-    print("\n[3/4] Converting response for TTS...")
-
-    tts_text, t_norm_elapsed = normalize_for_tts(reply)
-    print(f"[TIMING] TTS_NORMALIZATION: {t_norm_elapsed:.3f}s")
-
-    print("TTS text:")
-    print(tts_text)
+    print("reply:", reply)
+    print("tts_text:", tts_text)
 
 
     # ========================================================
-    # 4. DEVANAGARI → PARLER TTS
+    # 3. DEVANAGARI → PARLER TTS
     # ========================================================
 
-    print("\n[4/4] Sending text to Parler TTS...")
+    print("\n[3/3] Sending text to Parler TTS...")
 
     t_tts_start = time.perf_counter()
 
@@ -368,12 +362,11 @@ async def chat(
     print("\n")
     print("=" * 60)
     print("REQUEST COMPLETE")
-    print(f"[TIMING] AUDIO_READ:        {t_read_elapsed:.3f}s")
-    print(f"[TIMING] ASR:               {t_asr_elapsed:.3f}s")
-    print(f"[TIMING] GEMMA:             {t_gemma_elapsed:.3f}s")
-    print(f"[TIMING] TTS_NORMALIZATION: {t_norm_elapsed:.3f}s")
-    print(f"[TIMING] TTS:               {t_tts_elapsed:.3f}s")
-    print(f"[TIMING] AGENT_TOTAL:       {t_total:.3f}s")
+    print(f"[TIMING] AUDIO_READ:  {t_read_elapsed:.3f}s")
+    print(f"[TIMING] ASR:         {t_asr_elapsed:.3f}s")
+    print(f"[TIMING] GEMMA:       {t_gemma_elapsed:.3f}s")
+    print(f"[TIMING] TTS:         {t_tts_elapsed:.3f}s")
+    print(f"[TIMING] AGENT_TOTAL: {t_total:.3f}s")
     print("=" * 60)
 
 
