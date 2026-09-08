@@ -128,6 +128,14 @@ async def process(request: Request):
 
 # ============================================================
 # BROWSER PAGE
+# Single-page call interface with:
+# - browser microphone via MediaRecorder
+# - RMS-based voice activity detection
+# - silence detection (~1.2 s)
+# - in-flight concurrency lock (single request at a time)
+# - HTTP POST to /process
+# - base64 WAV playback
+# - microphone listening resumes after audio playback completes
 # ============================================================
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -137,43 +145,34 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Jain MBA Admissions – Divya</title>
 <style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 640px; margin: 30px auto; padding: 24px; background: #f8fafc; color: #1e293b; }
-  .card { background: #ffffff; border-radius: 12px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -2px rgba(0,0,0,0.05); }
-  h1 { font-size: 1.35em; margin-top: 0; color: #0f172a; }
-  .subtitle { font-size: 0.9em; color: #64748b; margin-bottom: 20px; }
-  #status { margin: 16px 0; padding: 14px 18px; border-radius: 8px; font-weight: 500; font-size: 0.95em; transition: all 0.2s ease; }
-  #status.listening { background: #dcfce7; color: #15803d; border-left: 4px solid #22c55e; }
-  #status.processing { background: #fef9c3; color: #a16207; border-left: 4px solid #eab308; }
-  #status.speaking { background: #dbeafe; color: #1d4ed8; border-left: 4px solid #3b82f6; }
-  #status.idle { background: #f1f5f9; color: #64748b; }
-  .btn-group { display: flex; gap: 12px; margin-top: 16px; }
-  button { padding: 12px 24px; font-size: 1em; font-weight: 600; border: none; border-radius: 8px; cursor: pointer; transition: opacity 0.15s; }
-  button:hover { opacity: 0.9; }
-  #startBtn { background: #16a34a; color: #fff; }
-  #endBtn   { background: #dc2626; color: #fff; display: none; }
-  .metrics { margin-top: 14px; font-size: 0.85em; color: #475569; }
-  #log { margin-top: 20px; font-size: 0.82em; color: #334155; white-space: pre-wrap; max-height: 320px; overflow-y: auto; background: #f8fafc; padding: 14px; border-radius: 8px; border: 1px solid #e2e8f0; font-family: monospace; }
+  body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; background: #f9f9f9; }
+  h1 { font-size: 1.4em; color: #333; }
+  #status { margin: 16px 0; padding: 12px; border-radius: 8px; background: #eee; font-size: 0.95em; }
+  #status.listening { background: #d4edda; color: #155724; }
+  #status.processing { background: #fff3cd; color: #856404; }
+  #status.speaking { background: #cce5ff; color: #004085; }
+  #status.idle { background: #eee; color: #555; }
+  button { padding: 12px 28px; font-size: 1em; border: none; border-radius: 8px; cursor: pointer; }
+  #startBtn { background: #28a745; color: #fff; }
+  #endBtn   { background: #dc3545; color: #fff; display: none; }
+  #log { margin-top: 20px; font-size: 0.82em; color: #555; white-space: pre-wrap; max-height: 300px; overflow-y: auto; background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #ddd; }
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>📞 Jain College MBA Admissions</h1>
-  <div class="subtitle">AI Telephony Admission Counselor – Divya (Fast Latency Pipeline)</div>
+<h1>📞 Jain College MBA Admissions</h1>
+<p>AI Admission Counselor – Divya</p>
 
-  <div class="btn-group">
-    <button id="startBtn" onclick="startCall()">📞 Start Call</button>
-    <button id="endBtn"   onclick="endCall()">🔴 End Call</button>
-  </div>
+<button id="startBtn" onclick="startCall()">📞 Start Call</button>
+<button id="endBtn"   onclick="endCall()">🔴 End Call</button>
 
-  <div id="status" class="idle">Press "Start Call" to begin speaking with Divya.</div>
-  <div id="log"></div>
-</div>
+<div id="status" class="idle">Press Start Call to begin.</div>
+<div id="log"></div>
 
 <script>
-const SILENCE_MS       = 1050;   // Snappy ~1.05s silence window for natural conversational turn-taking
-const RMS_THRESHOLD    = 0.012;  // Voice activity detection sensitivity
+const SILENCE_MS       = 1200;   // ms of silence before sending
+const RMS_THRESHOLD    = 0.012;  // voice activity threshold
 const SAMPLE_RATE      = 16000;
-const CHUNK_MS         = 80;     // Analyser poll interval
+const CHUNK_MS         = 100;    // analyser poll interval
 
 let mediaStream        = null;
 let audioContext       = null;
@@ -181,14 +180,16 @@ let analyser           = null;
 let mediaRecorder      = null;
 let recordedChunks     = [];
 let silenceTimer       = null;
+let vadTimeoutId       = null;
 let speaking           = false;
 let callActive         = false;
 let divyaSpeaking      = false;
+let isProcessing       = false;  // client-side in-flight / processing lock
 let sessionId          = null;
 
 function log(msg) {
   const el = document.getElementById("log");
-  el.textContent += "[" + new Date().toLocaleTimeString() + "] " + msg + "\\n";
+  el.textContent += new Date().toLocaleTimeString() + "  " + msg + "\\n";
   el.scrollTop = el.scrollHeight;
 }
 
@@ -199,17 +200,17 @@ function setStatus(text, cls) {
 }
 
 function generateSessionId() {
-  return "call-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+  return "browser-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
 }
 
 async function startCall() {
   sessionId = generateSessionId();
-  log("Session initiated: " + sessionId);
+  log("Session: " + sessionId);
 
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
   } catch (e) {
-    log("Microphone access error: " + e);
+    log("Microphone error: " + e);
     return;
   }
 
@@ -219,22 +220,27 @@ async function startCall() {
   }
 
   const source = audioContext.createMediaStreamSource(mediaStream);
+
   analyser = audioContext.createAnalyser();
   analyser.fftSize = 512;
   source.connect(analyser);
 
   callActive = true;
+  isProcessing = false;
+  divyaSpeaking = false;
   document.getElementById("startBtn").style.display = "none";
   document.getElementById("endBtn").style.display   = "inline-block";
 
-  setStatus("🎙️ Listening... (Speak now)", "listening");
-  log("Call connected. Listening for speech...");
+  setStatus("🎙️ Listening...", "listening");
+  log("Call started.");
 
   startListening();
 }
 
 function endCall() {
   callActive = false;
+  isProcessing = false;
+  divyaSpeaking = false;
   stopListening();
   if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
   if (audioContext) audioContext.close();
@@ -245,10 +251,14 @@ function endCall() {
 }
 
 function startListening() {
-  if (!callActive || divyaSpeaking) return;
+  if (!callActive || isProcessing || divyaSpeaking) return;
 
   recordedChunks = [];
   speaking       = false;
+  clearTimeout(silenceTimer);
+  silenceTimer = null;
+  clearTimeout(vadTimeoutId);
+  vadTimeoutId = null;
 
   try {
     mediaRecorder = new MediaRecorder(mediaStream);
@@ -257,6 +267,7 @@ function startListening() {
     mediaRecorder.start(CHUNK_MS);
   } catch (e) {
     log("MediaRecorder start error: " + e);
+    return;
   }
 
   pollVAD();
@@ -264,13 +275,16 @@ function startListening() {
 
 function stopListening() {
   clearTimeout(silenceTimer);
+  silenceTimer = null;
+  clearTimeout(vadTimeoutId);
+  vadTimeoutId = null;
   if (mediaRecorder && mediaRecorder.state !== "inactive") {
     mediaRecorder.stop();
   }
 }
 
 function pollVAD() {
-  if (!callActive || divyaSpeaking) return;
+  if (!callActive || isProcessing || divyaSpeaking) return;
 
   const buf = new Float32Array(analyser.fftSize);
   analyser.getFloatTimeDomainData(buf);
@@ -283,34 +297,44 @@ function pollVAD() {
     if (!speaking) {
       speaking = true;
       clearTimeout(silenceTimer);
-      log("Voice detected (RMS: " + rms.toFixed(4) + ")");
+      log("Voice detected (RMS " + rms.toFixed(4) + ")");
     } else {
       clearTimeout(silenceTimer);
     }
     silenceTimer = setTimeout(onSilence, SILENCE_MS);
   }
 
-  setTimeout(pollVAD, CHUNK_MS);
+  if (callActive && !isProcessing && !divyaSpeaking) {
+    vadTimeoutId = setTimeout(pollVAD, CHUNK_MS);
+  }
 }
 
 function onSilence() {
-  if (!speaking || !callActive || divyaSpeaking) return;
-  log("Silence detected -> sending utterance to backend...");
+  if (!speaking || !callActive || isProcessing || divyaSpeaking) return;
+
+  // Immediately set processing lock to block any concurrent utterances
+  isProcessing = true;
+  log("Silence detected – sending audio...");
+  log("Processing utterance...");
   stopListening();
 }
 
 function onRecordingStop() {
   if (!speaking || recordedChunks.length === 0) {
+    isProcessing = false;
     if (callActive && !divyaSpeaking) startListening();
     return;
   }
 
   const blob = new Blob(recordedChunks, { type: "audio/webm" });
+  log("Audio blob: " + blob.size + " bytes");
   sendAudio(blob);
 }
 
 async function sendAudio(blob) {
-  setStatus("⏳ Processing response...", "processing");
+  isProcessing = true;
+  setStatus("⏳ Processing...", "processing");
+
   const t0 = performance.now();
 
   try {
@@ -325,32 +349,43 @@ async function sendAudio(blob) {
     });
 
     const t1 = performance.now();
-    const roundtrip = ((t1 - t0) / 1000).toFixed(3);
-    log("[TIMING] ROUNDTRIP: " + roundtrip + "s");
+    log("[TIMING] BROWSER_POST_ROUNDTRIP: " + ((t1 - t0) / 1000).toFixed(3) + "s");
 
     if (!response.ok) {
       log("Server error: " + response.status);
-      setStatus("🎙️ Listening...", "listening");
-      startListening();
+      isProcessing = false;
+      if (callActive && !divyaSpeaking) {
+        setStatus("🎙️ Listening...", "listening");
+        log("Response received. Resuming listening...");
+        startListening();
+      }
       return;
     }
 
     const data = await response.json();
 
-    if (data.transcript) log("Student: " + data.transcript);
-    if (data.reply)      log("Divya:   " + data.reply);
+    if (data.transcript) log("You: " + data.transcript);
+    if (data.reply)      log("Divya: " + data.reply);
 
     if (data.audio_b64) {
       await playAudio(data.audio_b64, data.sample_rate || 22050);
     } else {
-      setStatus("🎙️ Listening...", "listening");
-      startListening();
+      isProcessing = false;
+      if (callActive && !divyaSpeaking) {
+        setStatus("🎙️ Listening...", "listening");
+        log("Response received. Resuming listening...");
+        startListening();
+      }
     }
 
   } catch (e) {
-    log("Network fetch error: " + e);
-    setStatus("🎙️ Listening...", "listening");
-    startListening();
+    log("Fetch error: " + e);
+    isProcessing = false;
+    if (callActive && !divyaSpeaking) {
+      setStatus("🎙️ Listening...", "listening");
+      log("Response received. Resuming listening...");
+      startListening();
+    }
   }
 }
 
@@ -359,8 +394,8 @@ async function playAudio(b64, sampleRate) {
   setStatus("🔊 Divya is speaking...", "speaking");
 
   try {
-    const binary = atob(b64);
-    const bytes  = new Uint8Array(binary.length);
+    const binary  = atob(b64);
+    const bytes   = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
     const t_decode_start = performance.now();
@@ -368,17 +403,22 @@ async function playAudio(b64, sampleRate) {
       await audioContext.resume();
     }
     const decoded = await audioContext.decodeAudioData(bytes.buffer);
-    const t_decode_elapsed = ((performance.now() - t_decode_start) / 1000).toFixed(3);
-    log("[TIMING] AUDIO_DECODE: " + t_decode_elapsed + "s");
+    const t_decode_elapsed = (performance.now() - t_decode_start) / 1000;
+    log("[TIMING] BROWSER_AUDIO_DECODE: " + t_decode_elapsed.toFixed(3) + "s");
 
     const source = audioContext.createBufferSource();
     source.buffer = decoded;
     source.connect(audioContext.destination);
 
+    const t_play_start = performance.now();
     source.onended = () => {
+      const t_play_end = performance.now();
+      log("[TIMING] BROWSER_AUDIO_PLAY: " + ((t_play_end - t_play_start) / 1000).toFixed(3) + "s");
       divyaSpeaking = false;
+      isProcessing = false;
       if (callActive) {
         setStatus("🎙️ Listening...", "listening");
+        log("Response received. Resuming listening...");
         startListening();
       }
     };
@@ -387,8 +427,10 @@ async function playAudio(b64, sampleRate) {
   } catch (err) {
     log("Audio playback error: " + err);
     divyaSpeaking = false;
+    isProcessing = false;
     if (callActive) {
       setStatus("🎙️ Listening...", "listening");
+      log("Response received. Resuming listening...");
       startListening();
     }
   }
