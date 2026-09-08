@@ -371,9 +371,14 @@ async def chat_stream(
         session_id = str(uuid.uuid4())
 
     async def event_generator() -> AsyncGenerator[str, None]:
-        t_start = time.perf_counter()
+        t_request_start = time.perf_counter()
         active_transcript = (transcript or "").strip()
         t_asr = 0.0
+
+        print("\n" + "=" * 60)
+        print("NEW STREAMING CHAT REQUEST")
+        print("Session:", session_id)
+        print("=" * 60)
 
         # Step 1: ASR if audio file provided
         if not active_transcript and file is not None:
@@ -389,10 +394,12 @@ async def chat_stream(
                 asr_response.raise_for_status()
                 active_transcript = asr_response.json().get("text", "").strip()
             except Exception as e:
+                print("ASR STREAM ERROR:", e)
                 yield f"data: {json.dumps({'type': 'error', 'stage': 'asr', 'error': str(e)})}\n\n"
                 return
 
             t_asr = time.perf_counter() - t_asr_start
+            print(f"[TIMING] ASR: {t_asr:.3f}s -> '{active_transcript}'")
             yield f"data: {json.dumps({'type': 'asr_final', 'transcript': active_transcript, 'asr_time_s': round(t_asr, 3)})}\n\n"
 
         if not active_transcript:
@@ -414,37 +421,77 @@ async def chat_stream(
             raw_gemma = gemma_response.json().get("reply", "").strip()
             reply, tts_text = parse_gemma_json(raw_gemma, fallback_reply=active_transcript)
         except Exception as e:
+            print("GEMMA STREAM ERROR:", e)
             yield f"data: {json.dumps({'type': 'error', 'stage': 'gemma', 'error': str(e)})}\n\n"
             return
 
         t_gemma_elapsed = time.perf_counter() - t_gemma_start
+        print(f"[TIMING] GEMMA_TOTAL: {t_gemma_elapsed:.3f}s")
         yield f"data: {json.dumps({'type': 'gemma_final', 'reply': reply, 'tts_text': tts_text, 'gemma_time_s': round(t_gemma_elapsed, 3)})}\n\n"
 
         # Step 3: Sentence-Pipelined TTS
         sentences = split_into_sentences(tts_text)
-        first_audio_emitted = False
-        t_first_audio = 0.0
+        t_gemma_first_sentence = time.perf_counter() - t_request_start
+        print(f"[TIMING] GEMMA_FIRST_SENTENCE: {t_gemma_first_sentence:.3f}s ({len(sentences)} chunks)")
+
+        first_audio_ready = False
+        t_tts_first_chunk = 0.0
+        t_first_audio_ready = 0.0
 
         for idx, sentence in enumerate(sentences):
-            t_tts_start = time.perf_counter()
+            t_tts_chunk_start = time.perf_counter()
             try:
                 tts_response = http_session.post(TTS_URL, json={"text": sentence}, timeout=120)
                 tts_response.raise_for_status()
                 tts_result = tts_response.json()
                 audio_b64 = tts_result.get("audio_b64")
                 sample_rate = tts_result.get("sample_rate", 22050)
-                t_tts_elapsed = time.perf_counter() - t_tts_start
+                t_tts_chunk_elapsed = time.perf_counter() - t_tts_chunk_start
 
-                if not first_audio_emitted:
-                    first_audio_emitted = True
-                    t_first_audio = time.perf_counter() - t_start
+                if not first_audio_ready:
+                    first_audio_ready = True
+                    t_tts_first_chunk = t_tts_chunk_elapsed
+                    t_first_audio_ready = time.perf_counter() - t_request_start
+                    print(f"[TIMING] TTS_FIRST_CHUNK: {t_tts_first_chunk:.3f}s")
+                    print(f"[TIMING] FIRST_AUDIO_READY: {t_first_audio_ready:.3f}s")
 
-                yield f"data: {json.dumps({'type': 'audio_chunk', 'chunk_index': idx, 'total_chunks': len(sentences), 'sentence': sentence, 'audio_b64': audio_b64, 'sample_rate': sample_rate, 'tts_time_s': round(t_tts_elapsed, 3), 'first_audio_latency_s': round(t_first_audio, 3)})}\n\n"
+                chunk_payload = {
+                    "type": "audio_chunk",
+                    "chunk_index": idx,
+                    "total_chunks": len(sentences),
+                    "sentence": sentence,
+                    "audio_b64": audio_b64,
+                    "sample_rate": sample_rate,
+                    "tts_time_s": round(t_tts_chunk_elapsed, 3),
+                    "first_audio_latency_s": round(t_first_audio_ready, 3)
+                }
+                yield f"data: {json.dumps(chunk_payload)}\n\n"
+
             except Exception as e:
+                print(f"TTS CHUNK {idx} ERROR:", e)
                 yield f"data: {json.dumps({'type': 'tts_chunk_error', 'chunk_index': idx, 'error': str(e)})}\n\n"
 
-        t_total = time.perf_counter() - t_start
-        yield f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'transcript': active_transcript, 'reply': reply, 'tts_text': tts_text, 'timings': {'asr_s': round(t_asr, 3), 'gemma_s': round(t_gemma_elapsed, 3), 'first_audio_latency_s': round(t_first_audio, 3), 'total_s': round(t_total, 3)}})}\n\n"
+        t_agent_total = time.perf_counter() - t_request_start
+        print(f"[TIMING] AGENT_TOTAL: {t_agent_total:.3f}s")
+        print("=" * 60 + "\n")
+
+        done_payload = {
+            "type": "done",
+            "session_id": session_id,
+            "transcript": active_transcript,
+            "reply": reply,
+            "tts_text": tts_text,
+            "total_chunks": len(sentences),
+            "timings": {
+                "asr_s": round(t_asr, 3),
+                "gemma_s": round(t_gemma_elapsed, 3),
+                "gemma_first_sentence_s": round(t_gemma_first_sentence, 3),
+                "tts_first_chunk_s": round(t_tts_first_chunk, 3),
+                "first_audio_ready_s": round(t_first_audio_ready, 3),
+                "agent_total_s": round(t_agent_total, 3)
+            }
+        }
+        yield f"data: {json.dumps(done_payload)}\n\n"
 
     return StreamingResponse(
         event_generator(),

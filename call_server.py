@@ -1,14 +1,16 @@
 import time
+import json
 import base64
 import uuid
 
 import requests
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 
-AGENT_URL = "http://127.0.0.1:8002/chat"
+AGENT_STREAM_URL = "http://127.0.0.1:8002/chat/stream"
+AGENT_BATCH_URL = "http://127.0.0.1:8002/chat"
 HOST = "0.0.0.0"
 PORT = 8080
 
@@ -16,7 +18,7 @@ app = FastAPI(title="MBA Call Browser Interface")
 
 # Persistent HTTP session for fast localhost forwarding
 http_session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20)
+adapter = requests.adapters.HTTPAdapter(pool_connections=15, pool_maxsize=30)
 http_session.mount("http://", adapter)
 http_session.mount("https://", adapter)
 
@@ -27,7 +29,7 @@ http_session.mount("https://", adapter)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "call-server"}
+    return {"status": "ok", "service": "call-server", "mode": "http-streaming"}
 
 
 # ============================================================
@@ -40,9 +42,9 @@ def index():
 
 
 # ============================================================
-# PROCESS ENDPOINT
+# PROCESS ENDPOINT (HTTP SSE Streaming)
 # Browser POSTs raw audio bytes here.
-# Returns base64-encoded WAV audio from Divya.
+# Streams Server-Sent Events with ASR, text, and TTS audio chunks.
 # ============================================================
 
 @app.post("/process")
@@ -50,7 +52,7 @@ async def process(request: Request):
     t_request_start = time.perf_counter()
 
     print("\n" + "=" * 60)
-    print("CALL SERVER: NEW REQUEST")
+    print("CALL SERVER: NEW STREAMING REQUEST")
 
     # 1. Read raw audio bytes from browser
     t_read_start = time.perf_counter()
@@ -67,63 +69,34 @@ async def process(request: Request):
     session_id = request.headers.get("X-Session-Id", str(uuid.uuid4()))
     print("Session:", session_id)
 
-    # 2. Forward audio to agent_api /chat
-    t_agent_start = time.perf_counter()
-    try:
-        agent_response = http_session.post(
-            AGENT_URL,
-            files={
-                "file": ("audio.wav", audio_bytes, "audio/wav")
-            },
-            data={
-                "session_id": session_id,
-                "language": "hi"
-            },
-            timeout=180
-        )
-        agent_response.raise_for_status()
-        agent_result = agent_response.json()
-    except Exception as e:
-        print("AGENT ERROR:", e)
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "error": str(e)}
-        )
+    # 2. Forward stream to agent_api /chat/stream
+    def stream_forwarder():
+        try:
+            with http_session.post(
+                AGENT_STREAM_URL,
+                files={"file": ("audio.wav", audio_bytes, "audio/wav")},
+                data={"session_id": session_id, "language": "hi"},
+                stream=True,
+                timeout=180
+            ) as agent_resp:
+                agent_resp.raise_for_status()
+                for line in agent_resp.iter_lines(decode_unicode=True):
+                    if line:
+                        yield f"{line}\n\n"
+        except Exception as e:
+            print("AGENT STREAM FORWARD ERROR:", e)
+            err_payload = json.dumps({"type": "error", "error": str(e)})
+            yield f"data: {err_payload}\n\n"
 
-    t_agent_elapsed = time.perf_counter() - t_agent_start
-    print(f"[TIMING] AGENT_ROUNDTRIP: {t_agent_elapsed:.3f}s")
-
-    # 3. Get base64 audio (in-memory direct pass-through, or fallback to file)
-    t_encode_start = time.perf_counter()
-    audio_b64 = agent_result.get("audio_b64")
-
-    if not audio_b64:
-        audio_file = agent_result.get("audio_file")
-        if audio_file:
-            try:
-                with open(audio_file, "rb") as f:
-                    audio_b64 = base64.b64encode(f.read()).decode("utf-8")
-            except Exception as e:
-                print("Audio file read error:", e)
-
-    t_encode_elapsed = time.perf_counter() - t_encode_start
-    t_total = time.perf_counter() - t_request_start
-
-    print(f"[TIMING] AUDIO_PREP: {t_encode_elapsed:.3f}s | TOTAL: {t_total:.3f}s")
-    print("=" * 60)
-
-    return JSONResponse(content={
-        "status": "success",
-        "session_id": session_id,
-        "transcript": agent_result.get("transcript", ""),
-        "reply": agent_result.get("reply", ""),
-        "audio_b64": audio_b64,
-        "sample_rate": agent_result.get("sample_rate", 22050),
-        "timings": {
-            "server_total_s": round(t_total, 3),
-            "agent_roundtrip_s": round(t_agent_elapsed, 3)
+    return StreamingResponse(
+        stream_forwarder(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
         }
-    })
+    )
 
 
 # ============================================================
@@ -133,9 +106,8 @@ async def process(request: Request):
 # - RMS-based voice activity detection
 # - silence detection (~1.2 s)
 # - in-flight concurrency lock (single request at a time)
-# - HTTP POST to /process
-# - base64 WAV playback
-# - microphone listening resumes after audio playback completes
+# - HTTP streaming SSE consumption
+# - gapless sequential Web Audio chunk queue player
 # ============================================================
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -155,12 +127,12 @@ HTML_PAGE = """<!DOCTYPE html>
   button { padding: 12px 28px; font-size: 1em; border: none; border-radius: 8px; cursor: pointer; }
   #startBtn { background: #28a745; color: #fff; }
   #endBtn   { background: #dc3545; color: #fff; display: none; }
-  #log { margin-top: 20px; font-size: 0.82em; color: #555; white-space: pre-wrap; max-height: 300px; overflow-y: auto; background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #ddd; }
+  #log { margin-top: 20px; font-size: 0.82em; color: #555; white-space: pre-wrap; max-height: 320px; overflow-y: auto; background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #ddd; }
 </style>
 </head>
 <body>
 <h1>📞 Jain College MBA Admissions</h1>
-<p>AI Admission Counselor – Divya</p>
+<p>AI Admission Counselor – Divya (Low-Latency Streaming Voice)</p>
 
 <button id="startBtn" onclick="startCall()">📞 Start Call</button>
 <button id="endBtn"   onclick="endCall()">🔴 End Call</button>
@@ -186,6 +158,12 @@ let callActive         = false;
 let divyaSpeaking      = false;
 let isProcessing       = false;  // client-side in-flight / processing lock
 let sessionId          = null;
+
+// Sequential Audio Chunk Playback Queue
+let audioQueue         = [];
+let isPlayingQueue     = false;
+let currentSource      = null;
+let isStreamDone       = false;
 
 function log(msg) {
   const el = document.getElementById("log");
@@ -228,6 +206,10 @@ async function startCall() {
   callActive = true;
   isProcessing = false;
   divyaSpeaking = false;
+  audioQueue = [];
+  isPlayingQueue = false;
+  isStreamDone = false;
+
   document.getElementById("startBtn").style.display = "none";
   document.getElementById("endBtn").style.display   = "inline-block";
 
@@ -242,6 +224,12 @@ function endCall() {
   isProcessing = false;
   divyaSpeaking = false;
   stopListening();
+  if (currentSource) {
+    try { currentSource.stop(); } catch (e) {}
+  }
+  audioQueue = [];
+  isPlayingQueue = false;
+
   if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
   if (audioContext) audioContext.close();
   document.getElementById("startBtn").style.display = "inline-block";
@@ -312,8 +300,12 @@ function pollVAD() {
 function onSilence() {
   if (!speaking || !callActive || isProcessing || divyaSpeaking) return;
 
-  // Immediately set processing lock to block any concurrent utterances
+  // Engage processing lock immediately to block any duplicate requests
   isProcessing = true;
+  isStreamDone = false;
+  audioQueue = [];
+  isPlayingQueue = false;
+
   log("Silence detected – sending audio...");
   log("Processing utterance...");
   stopListening();
@@ -328,10 +320,10 @@ function onRecordingStop() {
 
   const blob = new Blob(recordedChunks, { type: "audio/webm" });
   log("Audio blob: " + blob.size + " bytes");
-  sendAudio(blob);
+  sendAudioStream(blob);
 }
 
-async function sendAudio(blob) {
+async function sendAudioStream(blob) {
   isProcessing = true;
   setStatus("⏳ Processing...", "processing");
 
@@ -353,49 +345,82 @@ async function sendAudio(blob) {
 
     if (!response.ok) {
       log("Server error: " + response.status);
-      isProcessing = false;
-      if (callActive && !divyaSpeaking) {
-        setStatus("🎙️ Listening...", "listening");
-        log("Response received. Resuming listening...");
-        startListening();
-      }
+      resetListening();
       return;
     }
 
-    const data = await response.json();
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
 
-    if (data.transcript) log("You: " + data.transcript);
-    if (data.reply)      log("Divya: " + data.reply);
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
 
-    if (data.audio_b64) {
-      await playAudio(data.audio_b64, data.sample_rate || 22050);
-    } else {
-      isProcessing = false;
-      if (callActive && !divyaSpeaking) {
-        setStatus("🎙️ Listening...", "listening");
-        log("Response received. Resuming listening...");
-        startListening();
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\\n\\n");
+      buffer = lines.pop(); // keep remainder
+
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const jsonStr = line.slice(6).trim();
+          if (jsonStr) {
+            try {
+              const event = JSON.parse(jsonStr);
+              handleStreamEvent(event);
+            } catch (err) {
+              console.error("JSON parse error on SSE:", err, jsonStr);
+            }
+          }
+        }
       }
     }
 
   } catch (e) {
     log("Fetch error: " + e);
-    isProcessing = false;
-    if (callActive && !divyaSpeaking) {
-      setStatus("🎙️ Listening...", "listening");
-      log("Response received. Resuming listening...");
-      startListening();
-    }
+    resetListening();
   }
 }
 
-async function playAudio(b64, sampleRate) {
-  divyaSpeaking = true;
-  setStatus("🔊 Divya is speaking...", "speaking");
+function handleStreamEvent(event) {
+  if (event.type === "asr_final") {
+    log("You: " + event.transcript);
+    log("[TIMING] ASR: " + event.asr_time_s + "s");
+  }
+  else if (event.type === "gemma_final") {
+    log("Divya: " + event.reply);
+    log("[TIMING] GEMMA_TOTAL: " + event.gemma_time_s + "s");
+  }
+  else if (event.type === "audio_chunk") {
+    log("Received Audio Chunk " + (event.chunk_index + 1) + "/" + event.total_chunks +
+        " (First Audio: " + event.first_audio_latency_s + "s, TTS: " + event.tts_time_s + "s)");
+    enqueueAudioChunk(event.audio_b64, event.sample_rate || 22050, event.first_audio_latency_s);
+  }
+  else if (event.type === "done") {
+    isStreamDone = true;
+    if (event.timings) {
+      log("[TIMING] GEMMA_FIRST_SENTENCE: " + event.timings.gemma_first_sentence_s + "s");
+      log("[TIMING] TTS_FIRST_CHUNK: " + event.timings.tts_first_chunk_s + "s");
+      log("[TIMING] FIRST_AUDIO_READY: " + event.timings.first_audio_ready_s + "s");
+      log("[TIMING] AGENT_TOTAL: " + event.timings.agent_total_s + "s");
+    }
+    // If no audio chunks were generated (e.g. empty reply), resume listening
+    if (!isPlayingQueue && audioQueue.length === 0) {
+      resetListening();
+    }
+  }
+  else if (event.type === "error") {
+    log("Stream stage error (" + event.stage + "): " + event.error);
+    resetListening();
+  }
+}
+
+async function enqueueAudioChunk(b64, sampleRate, firstAudioLatency) {
+  if (!b64) return;
 
   try {
-    const binary  = atob(b64);
-    const bytes   = new Uint8Array(binary.length);
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
     const t_decode_start = performance.now();
@@ -406,14 +431,23 @@ async function playAudio(b64, sampleRate) {
     const t_decode_elapsed = (performance.now() - t_decode_start) / 1000;
     log("[TIMING] BROWSER_AUDIO_DECODE: " + t_decode_elapsed.toFixed(3) + "s");
 
-    const source = audioContext.createBufferSource();
-    source.buffer = decoded;
-    source.connect(audioContext.destination);
+    audioQueue.push(decoded);
 
-    const t_play_start = performance.now();
-    source.onended = () => {
-      const t_play_end = performance.now();
-      log("[TIMING] BROWSER_AUDIO_PLAY: " + ((t_play_end - t_play_start) / 1000).toFixed(3) + "s");
+    if (!isPlayingQueue) {
+      playNextQueueChunk();
+    }
+  } catch (err) {
+    console.error("Audio decode error:", err);
+    if (!isPlayingQueue && isStreamDone && audioQueue.length === 0) {
+      resetListening();
+    }
+  }
+}
+
+function playNextQueueChunk() {
+  if (audioQueue.length === 0) {
+    if (isStreamDone) {
+      isPlayingQueue = false;
       divyaSpeaking = false;
       isProcessing = false;
       if (callActive) {
@@ -421,18 +455,43 @@ async function playAudio(b64, sampleRate) {
         log("Response received. Resuming listening...");
         startListening();
       }
-    };
-
-    source.start();
-  } catch (err) {
-    log("Audio playback error: " + err);
-    divyaSpeaking = false;
-    isProcessing = false;
-    if (callActive) {
-      setStatus("🎙️ Listening...", "listening");
-      log("Response received. Resuming listening...");
-      startListening();
+    } else {
+      // Waiting for subsequent sentence chunks to arrive over SSE stream
+      isPlayingQueue = false;
     }
+    return;
+  }
+
+  isPlayingQueue = true;
+  divyaSpeaking = true;
+  setStatus("🔊 Divya is speaking...", "speaking");
+
+  const buffer = audioQueue.shift();
+  const source = audioContext.createBufferSource();
+  source.buffer = buffer;
+  source.connect(audioContext.destination);
+  currentSource = source;
+
+  const t_play_start = performance.now();
+  source.onended = () => {
+    const t_play_end = performance.now();
+    log("[TIMING] BROWSER_AUDIO_PLAY: " + ((t_play_end - t_play_start) / 1000).toFixed(3) + "s");
+    playNextQueueChunk();
+  };
+
+  source.start();
+}
+
+function resetListening() {
+  isProcessing = false;
+  divyaSpeaking = false;
+  isPlayingQueue = false;
+  isStreamDone = true;
+  audioQueue = [];
+  if (callActive) {
+    setStatus("🎙️ Listening...", "listening");
+    log("Response received. Resuming listening...");
+    startListening();
   }
 }
 </script>
