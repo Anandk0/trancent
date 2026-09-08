@@ -2,9 +2,11 @@ import re
 import json
 import time
 import codecs
+import queue
+import threading
 import requests
 import uuid
-from typing import AsyncGenerator
+from typing import Generator
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -17,6 +19,7 @@ import uvicorn
 
 ASR_URL = "http://127.0.0.1:8001/transcribe"
 GEMMA_URL = "http://127.0.0.1:8000/chat"
+GEMMA_STREAM_URL = "http://127.0.0.1:8000/chat/stream"
 TTS_URL = "http://127.0.0.1:8003/synthesize"
 
 HOST = "0.0.0.0"
@@ -234,20 +237,23 @@ def extract_complete_sentences(buffer_text: str) -> tuple:
 
 def stream_gemma_text(session_id: str, prompt: str, timings: dict):
     """
-    Opens a streaming HTTP request to the Gemma service and yields plain
-    text chunks as bytes arrive on the socket, instead of buffering the
-    whole response before returning (as `response.json()` would force).
+    Opens a streaming HTTP request to the Gemma service's /chat/stream route
+    and yields plain text chunks as tokens arrive on the socket, instead of
+    buffering the whole response before returning (as `response.json()` on the
+    batch /chat route would force).
 
-    Also detects whether the backend is genuinely emitting incremental
-    text or whether it is actually returning one fully-buffered JSON blob
-    (the current known /chat contract: {"reply": "..."}) despite the
-    streaming transport, and records that in `timings['gemma_genuinely_streaming']`
-    plus `timings['gemma_chunk_count']` so the caller can honestly report it.
+    /chat/stream on gemma_server.py drives model.generate() through a
+    TextIteratorStreamer on a background thread, so tokens are emitted as the
+    model produces them. This function still keeps a safety detector: if the
+    backend ever responds with one fully-buffered JSON blob (the batch /chat
+    contract: {"reply": "..."}) instead of genuine token text, it records that
+    in `timings['gemma_genuinely_streaming']` plus `timings['gemma_chunk_count']`
+    and recovers the reply, so the caller can honestly report what happened.
     """
     t_start = timings["t_request_start"]
 
     response = http_session.post(
-        GEMMA_URL,
+        GEMMA_STREAM_URL,
         json={"session_id": session_id, "text": prompt, "stream": True},
         stream=True,
         timeout=120,
@@ -492,9 +498,20 @@ async def chat_stream(
     if not session_id:
         session_id = str(uuid.uuid4())
 
-    async def event_generator() -> AsyncGenerator[str, None]:
+    # Read the upload once, up front, so the SSE body can be a synchronous
+    # generator (Starlette runs sync generators in a worker thread, which lets
+    # us safely block on a Queue while a producer thread reads Gemma tokens).
+    transcript_arg = transcript
+    audio_bytes = await file.read() if file is not None else None
+    audio_filename = (file.filename or "audio.wav") if file is not None else "audio.wav"
+    audio_content_type = (file.content_type or "audio/wav") if file is not None else "audio/wav"
+
+    # Sentinel marking end-of-stream on the sentence queue.
+    _QUEUE_DONE = object()
+
+    def event_generator() -> Generator[str, None, None]:
         t_request_start = time.perf_counter()
-        active_transcript = (transcript or "").strip()
+        active_transcript = (transcript_arg or "").strip()
         t_asr = 0.0
 
         print("\n" + "=" * 60)
@@ -502,14 +519,13 @@ async def chat_stream(
         print("Session:", session_id)
         print("=" * 60)
 
-        # Step 1: ASR if audio file provided
-        if not active_transcript and file is not None:
+        # Step 1: ASR if audio provided and no transcript override
+        if not active_transcript and audio_bytes is not None:
             t_asr_start = time.perf_counter()
-            audio_bytes = await file.read()
             try:
                 asr_response = http_session.post(
                     ASR_URL,
-                    files={"file": (file.filename or "audio.wav", audio_bytes, file.content_type or "audio/wav")},
+                    files={"file": (audio_filename, audio_bytes, audio_content_type)},
                     data={"language": language, "decoding": "ctc"},
                     timeout=120
                 )
@@ -528,90 +544,107 @@ async def chat_stream(
             yield f"data: {json.dumps({'type': 'done', 'reply': '', 'tts_text': '', 'audio_chunks': 0})}\n\n"
             return
 
-        # Step 2: Gemma — streamed plain text, sentence-pipelined into TTS
-        # as each phrase/sentence boundary is reached, instead of waiting
-        # for the complete Gemma response before starting synthesis.
+        # Step 2: Producer/consumer streaming pipeline.
+        #
+        #   Gemma producer thread          main (consumer) generator
+        #   --------------------           -------------------------
+        #   read /chat/stream tokens        block on sentence_queue.get()
+        #   accumulate sentence buffer      TTS-synthesize each sentence in
+        #   on sentence boundary: put()  →  FIFO order (single worker, so audio
+        #   ...continue reading Gemma       chunks stay correctly ordered)
+        #                                   yield audio_chunk SSE
+        #
+        # Because the producer keeps reading Gemma while the consumer is busy
+        # synthesizing, TTS(sentence 1) overlaps Gemma generating sentence 2.
         yield f"data: {json.dumps({'type': 'gemma_start'})}\n\n"
         streaming_prompt = build_streaming_prompt(active_transcript)
 
         timings = {"t_request_start": t_request_start}
-        pending_buffer = ""
-        reply_parts = []
+        sentence_queue: "queue.Queue" = queue.Queue()
+        producer_state = {"reply_parts": [], "error": None}
+
+        def gemma_producer():
+            buffer = ""
+            try:
+                for text_piece in stream_gemma_text(session_id, streaming_prompt, timings):
+                    producer_state["reply_parts"].append(text_piece)
+                    buffer += text_piece
+                    sentences, buffer = extract_complete_sentences(buffer)
+                    for sentence in sentences:
+                        if "gemma_first_sentence_s" not in timings:
+                            timings["gemma_first_sentence_s"] = round(time.perf_counter() - t_request_start, 3)
+                            print(f"[TIMING] GEMMA_FIRST_TOKEN: {timings.get('gemma_first_token_s', 0):.3f}s")
+                            print(f"[TIMING] GEMMA_FIRST_TEXT_CHUNK: {timings.get('gemma_first_text_chunk_s', 0):.3f}s")
+                            print(f"[TIMING] GEMMA_FIRST_SENTENCE: {timings['gemma_first_sentence_s']:.3f}s")
+                        sentence_queue.put(sentence)
+
+                # Flush any trailing text that never hit a sentence boundary.
+                tail = buffer.strip()
+                if tail:
+                    if "gemma_first_sentence_s" not in timings:
+                        timings["gemma_first_sentence_s"] = round(time.perf_counter() - t_request_start, 3)
+                    sentence_queue.put(tail)
+            except Exception as e:
+                producer_state["error"] = str(e)
+                print("GEMMA STREAM ERROR:", e)
+            finally:
+                sentence_queue.put(_QUEUE_DONE)
+
+        producer = threading.Thread(target=gemma_producer, name="gemma-producer", daemon=True)
+        producer.start()
+
+        # Consumer: drain sentences in order, one TTS call at a time.
         chunk_index = 0
         first_audio_ready = False
         t_tts_first_chunk = 0.0
         t_first_audio_ready = 0.0
 
-        def synthesize_sentence(sentence: str):
-            """Runs a single blocking TTS call for one accumulated sentence
-            and returns the SSE payload dict for it. Never called with
-            individual tokens — only complete sentence/clause chunks."""
-            nonlocal chunk_index, first_audio_ready, t_tts_first_chunk, t_first_audio_ready
-            idx = chunk_index
-            chunk_index += 1
+        while True:
+            sentence = sentence_queue.get()
+            if sentence is _QUEUE_DONE:
+                break
+
             t_tts_chunk_start = time.perf_counter()
-            tts_response = http_session.post(TTS_URL, json={"text": sentence}, timeout=120)
-            tts_response.raise_for_status()
-            tts_result = tts_response.json()
-            audio_b64 = tts_result.get("audio_b64")
-            sample_rate = tts_result.get("sample_rate", 22050)
-            t_tts_chunk_elapsed = time.perf_counter() - t_tts_chunk_start
-
-            if not first_audio_ready:
-                first_audio_ready = True
-                t_tts_first_chunk = t_tts_chunk_elapsed
-                t_first_audio_ready = time.perf_counter() - t_request_start
-                print(f"[TIMING] TTS_FIRST_CHUNK: {t_tts_first_chunk:.3f}s")
-                print(f"[TIMING] FIRST_AUDIO_READY: {t_first_audio_ready:.3f}s")
-
-            return {
-                "type": "audio_chunk",
-                "chunk_index": idx,
-                "total_chunks": None,
-                "sentence": sentence,
-                "audio_b64": audio_b64,
-                "sample_rate": sample_rate,
-                "tts_time_s": round(t_tts_chunk_elapsed, 3),
-                "first_audio_latency_s": round(t_first_audio_ready, 3)
-            }
-
-        try:
-            for text_piece in stream_gemma_text(session_id, streaming_prompt, timings):
-                reply_parts.append(text_piece)
-                pending_buffer += text_piece
-
-                sentences, pending_buffer = extract_complete_sentences(pending_buffer)
-                for sentence in sentences:
-                    if "gemma_first_sentence_s" not in timings:
-                        timings["gemma_first_sentence_s"] = round(time.perf_counter() - t_request_start, 3)
-                        print(f"[TIMING] GEMMA_FIRST_TOKEN: {timings.get('gemma_first_token_s', 0):.3f}s")
-                        print(f"[TIMING] GEMMA_FIRST_TEXT_CHUNK: {timings.get('gemma_first_text_chunk_s', 0):.3f}s")
-                        print(f"[TIMING] GEMMA_FIRST_SENTENCE: {timings['gemma_first_sentence_s']:.3f}s")
-
-                    try:
-                        chunk_payload = synthesize_sentence(sentence)
-                        yield f"data: {json.dumps(chunk_payload)}\n\n"
-                    except Exception as e:
-                        print(f"TTS CHUNK {chunk_index} ERROR:", e)
-                        yield f"data: {json.dumps({'type': 'tts_chunk_error', 'chunk_index': chunk_index, 'error': str(e)})}\n\n"
-        except Exception as e:
-            print("GEMMA STREAM ERROR:", e)
-            yield f"data: {json.dumps({'type': 'error', 'stage': 'gemma', 'error': str(e)})}\n\n"
-            return
-
-        # Flush any trailing text that never reached a sentence boundary
-        trailing = pending_buffer.strip()
-        if trailing:
-            if "gemma_first_sentence_s" not in timings:
-                timings["gemma_first_sentence_s"] = round(time.perf_counter() - t_request_start, 3)
             try:
-                chunk_payload = synthesize_sentence(trailing)
+                tts_response = http_session.post(TTS_URL, json={"text": sentence}, timeout=120)
+                tts_response.raise_for_status()
+                tts_result = tts_response.json()
+                audio_b64 = tts_result.get("audio_b64")
+                sample_rate = tts_result.get("sample_rate", 22050)
+                t_tts_chunk_elapsed = time.perf_counter() - t_tts_chunk_start
+
+                if not first_audio_ready:
+                    first_audio_ready = True
+                    t_tts_first_chunk = t_tts_chunk_elapsed
+                    t_first_audio_ready = time.perf_counter() - t_request_start
+                    print(f"[TIMING] TTS_FIRST_CHUNK: {t_tts_first_chunk:.3f}s")
+                    print(f"[TIMING] FIRST_AUDIO_READY: {t_first_audio_ready:.3f}s")
+
+                chunk_payload = {
+                    "type": "audio_chunk",
+                    "chunk_index": chunk_index,
+                    "total_chunks": None,
+                    "sentence": sentence,
+                    "audio_b64": audio_b64,
+                    "sample_rate": sample_rate,
+                    "tts_time_s": round(t_tts_chunk_elapsed, 3),
+                    "first_audio_latency_s": round(t_first_audio_ready, 3)
+                }
                 yield f"data: {json.dumps(chunk_payload)}\n\n"
+                chunk_index += 1
             except Exception as e:
                 print(f"TTS CHUNK {chunk_index} ERROR:", e)
                 yield f"data: {json.dumps({'type': 'tts_chunk_error', 'chunk_index': chunk_index, 'error': str(e)})}\n\n"
+                chunk_index += 1
 
-        reply = "".join(reply_parts).strip()
+        producer.join()
+
+        # If Gemma streaming failed and produced no audio, surface the error.
+        if producer_state["error"] and chunk_index == 0:
+            yield f"data: {json.dumps({'type': 'error', 'stage': 'gemma', 'error': producer_state['error']})}\n\n"
+            return
+
+        reply = "".join(producer_state["reply_parts"]).strip()
         t_gemma_elapsed = timings.get("gemma_total_s", round(time.perf_counter() - t_request_start, 3))
         print(f"[TIMING] GEMMA_TOTAL: {t_gemma_elapsed:.3f}s")
         print(f"[TIMING] GEMMA_GENUINELY_STREAMING: {timings.get('gemma_genuinely_streaming', False)} "
