@@ -1,6 +1,7 @@
 import re
 import json
 import time
+import codecs
 import requests
 import uuid
 from typing import AsyncGenerator
@@ -181,6 +182,127 @@ def parse_gemma_json(raw: str, fallback_reply: str = "") -> tuple:
     reply = text or fallback_reply
     print("[WARN] JSON parse failed; using raw Gemma output.")
     return reply, reply
+
+
+# ============================================================
+# STREAMING-FRIENDLY GEMMA PROMPT (/chat/stream only)
+#
+# The structured JSON contract used by /chat cannot be parsed until the
+# closing brace arrives, which forces the caller to wait for the entire
+# Gemma response. For /chat/stream we instead ask Gemma for plain
+# conversational text only (already Devanagari-normalized per the same
+# rules), so partial output is usable the moment it arrives and no second
+# LLM call is needed to normalize it for TTS.
+# ============================================================
+
+def build_streaming_prompt(transcript: str) -> str:
+    return f"""You are Divya, the AI admissions counselor for Regular MBA at Jain College of Engineering and Research, Udyambag, Belagavi (VTU affiliated, AICTE approved).
+
+Respond directly to the student's message.
+Keep your response concise, helpful, and natural for a phone call (1 to 3 sentences maximum).
+
+Return ONLY the spoken reply text. Do NOT use JSON, markdown, or any labels.
+
+If the reply is in Hindi or Hinglish, write the ENTIRE reply in Devanagari script.
+English professional words in Hindi/Hinglish must be written phonetically in Devanagari (e.g., MBA → एमबीए, HR → एचआर, Finance → फाइनेंस, Marketing → मार्केटिंग, Placement → प्लेसमेंट, Admission → एडमिशन, Specialization → स्पेशलाइज़ेशन, Business Analytics → बिज़नेस एनालिटिक्स).
+If the reply is purely in English, keep it in English.
+Do NOT include unnecessary punctuation around English words.
+
+Specializations available: Marketing, Finance, Human Resource Management, Business Analytics.
+Do NOT invent fees, placement percentages, salary figures, recruiter names, or unverified deadlines.
+
+Student message:
+{transcript}"""
+
+
+_SENTENCE_BOUNDARY_RE = re.compile(r'[।\.\?\!\n]+')
+
+
+def extract_complete_sentences(buffer_text: str) -> tuple:
+    """
+    Given the accumulated (not-yet-flushed) streamed text, split off every
+    complete sentence/clause ending in a boundary character, and return the
+    remaining unterminated tail so it can keep accumulating.
+    """
+    matches = list(_SENTENCE_BOUNDARY_RE.finditer(buffer_text))
+    if not matches:
+        return [], buffer_text
+    last_end = matches[-1].end()
+    sentences = split_into_sentences(buffer_text[:last_end])
+    return sentences, buffer_text[last_end:]
+
+
+def stream_gemma_text(session_id: str, prompt: str, timings: dict):
+    """
+    Opens a streaming HTTP request to the Gemma service and yields plain
+    text chunks as bytes arrive on the socket, instead of buffering the
+    whole response before returning (as `response.json()` would force).
+
+    Also detects whether the backend is genuinely emitting incremental
+    text or whether it is actually returning one fully-buffered JSON blob
+    (the current known /chat contract: {"reply": "..."}) despite the
+    streaming transport, and records that in `timings['gemma_genuinely_streaming']`
+    plus `timings['gemma_chunk_count']` so the caller can honestly report it.
+    """
+    t_start = timings["t_request_start"]
+
+    response = http_session.post(
+        GEMMA_URL,
+        json={"session_id": session_id, "text": prompt, "stream": True},
+        stream=True,
+        timeout=120,
+    )
+    response.raise_for_status()
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+    raw_accum = ""
+    chunk_count = 0
+    is_json_mode = None  # decided once the first non-whitespace char is seen
+
+    for raw_bytes in response.iter_content(chunk_size=64):
+        if not raw_bytes:
+            continue
+
+        piece = decoder.decode(raw_bytes)
+        if not piece:
+            continue
+
+        now = time.perf_counter() - t_start
+        if "gemma_first_token_s" not in timings:
+            timings["gemma_first_token_s"] = round(now, 3)
+
+        raw_accum += piece
+        chunk_count += 1
+
+        if is_json_mode is None:
+            stripped = raw_accum.lstrip()
+            if stripped:
+                is_json_mode = stripped.startswith("{") or stripped.startswith("```")
+
+        if not is_json_mode:
+            if "gemma_first_text_chunk_s" not in timings:
+                timings["gemma_first_text_chunk_s"] = round(now, 3)
+            yield piece
+
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        raw_accum += tail
+        if not is_json_mode:
+            yield tail
+
+    timings["gemma_total_s"] = round(time.perf_counter() - t_start, 3)
+    timings["gemma_chunk_count"] = chunk_count
+    # Genuinely streaming only if plain text arrived across multiple reads;
+    # a single chunk (or JSON that must be parsed whole) means the backend
+    # buffered the full generation before responding.
+    timings["gemma_genuinely_streaming"] = bool(not is_json_mode and chunk_count > 1)
+
+    if is_json_mode:
+        reply, _ = parse_gemma_json(raw_accum, fallback_reply=raw_accum.strip())
+        if "gemma_first_text_chunk_s" not in timings:
+            timings["gemma_first_text_chunk_s"] = timings["gemma_total_s"]
+        print("[WARN] Gemma backend returned buffered JSON on /chat/stream; no genuine token streaming observed.")
+        yield reply
 
 
 # ============================================================
@@ -406,70 +528,95 @@ async def chat_stream(
             yield f"data: {json.dumps({'type': 'done', 'reply': '', 'tts_text': '', 'audio_chunks': 0})}\n\n"
             return
 
-        # Step 2: Gemma
+        # Step 2: Gemma — streamed plain text, sentence-pipelined into TTS
+        # as each phrase/sentence boundary is reached, instead of waiting
+        # for the complete Gemma response before starting synthesis.
         yield f"data: {json.dumps({'type': 'gemma_start'})}\n\n"
-        t_gemma_start = time.perf_counter()
-        structured_prompt = build_structured_prompt(active_transcript)
+        streaming_prompt = build_streaming_prompt(active_transcript)
+
+        timings = {"t_request_start": t_request_start}
+        pending_buffer = ""
+        reply_parts = []
+        chunk_index = 0
+        first_audio_ready = False
+        t_tts_first_chunk = 0.0
+        t_first_audio_ready = 0.0
+
+        def synthesize_sentence(sentence: str):
+            """Runs a single blocking TTS call for one accumulated sentence
+            and returns the SSE payload dict for it. Never called with
+            individual tokens — only complete sentence/clause chunks."""
+            nonlocal chunk_index, first_audio_ready, t_tts_first_chunk, t_first_audio_ready
+            idx = chunk_index
+            chunk_index += 1
+            t_tts_chunk_start = time.perf_counter()
+            tts_response = http_session.post(TTS_URL, json={"text": sentence}, timeout=120)
+            tts_response.raise_for_status()
+            tts_result = tts_response.json()
+            audio_b64 = tts_result.get("audio_b64")
+            sample_rate = tts_result.get("sample_rate", 22050)
+            t_tts_chunk_elapsed = time.perf_counter() - t_tts_chunk_start
+
+            if not first_audio_ready:
+                first_audio_ready = True
+                t_tts_first_chunk = t_tts_chunk_elapsed
+                t_first_audio_ready = time.perf_counter() - t_request_start
+                print(f"[TIMING] TTS_FIRST_CHUNK: {t_tts_first_chunk:.3f}s")
+                print(f"[TIMING] FIRST_AUDIO_READY: {t_first_audio_ready:.3f}s")
+
+            return {
+                "type": "audio_chunk",
+                "chunk_index": idx,
+                "total_chunks": None,
+                "sentence": sentence,
+                "audio_b64": audio_b64,
+                "sample_rate": sample_rate,
+                "tts_time_s": round(t_tts_chunk_elapsed, 3),
+                "first_audio_latency_s": round(t_first_audio_ready, 3)
+            }
 
         try:
-            gemma_response = http_session.post(
-                GEMMA_URL,
-                json={"session_id": session_id, "text": structured_prompt},
-                timeout=120
-            )
-            gemma_response.raise_for_status()
-            raw_gemma = gemma_response.json().get("reply", "").strip()
-            reply, tts_text = parse_gemma_json(raw_gemma, fallback_reply=active_transcript)
+            for text_piece in stream_gemma_text(session_id, streaming_prompt, timings):
+                reply_parts.append(text_piece)
+                pending_buffer += text_piece
+
+                sentences, pending_buffer = extract_complete_sentences(pending_buffer)
+                for sentence in sentences:
+                    if "gemma_first_sentence_s" not in timings:
+                        timings["gemma_first_sentence_s"] = round(time.perf_counter() - t_request_start, 3)
+                        print(f"[TIMING] GEMMA_FIRST_TOKEN: {timings.get('gemma_first_token_s', 0):.3f}s")
+                        print(f"[TIMING] GEMMA_FIRST_TEXT_CHUNK: {timings.get('gemma_first_text_chunk_s', 0):.3f}s")
+                        print(f"[TIMING] GEMMA_FIRST_SENTENCE: {timings['gemma_first_sentence_s']:.3f}s")
+
+                    try:
+                        chunk_payload = synthesize_sentence(sentence)
+                        yield f"data: {json.dumps(chunk_payload)}\n\n"
+                    except Exception as e:
+                        print(f"TTS CHUNK {chunk_index} ERROR:", e)
+                        yield f"data: {json.dumps({'type': 'tts_chunk_error', 'chunk_index': chunk_index, 'error': str(e)})}\n\n"
         except Exception as e:
             print("GEMMA STREAM ERROR:", e)
             yield f"data: {json.dumps({'type': 'error', 'stage': 'gemma', 'error': str(e)})}\n\n"
             return
 
-        t_gemma_elapsed = time.perf_counter() - t_gemma_start
-        print(f"[TIMING] GEMMA_TOTAL: {t_gemma_elapsed:.3f}s")
-        yield f"data: {json.dumps({'type': 'gemma_final', 'reply': reply, 'tts_text': tts_text, 'gemma_time_s': round(t_gemma_elapsed, 3)})}\n\n"
-
-        # Step 3: Sentence-Pipelined TTS
-        sentences = split_into_sentences(tts_text)
-        t_gemma_first_sentence = time.perf_counter() - t_request_start
-        print(f"[TIMING] GEMMA_FIRST_SENTENCE: {t_gemma_first_sentence:.3f}s ({len(sentences)} chunks)")
-
-        first_audio_ready = False
-        t_tts_first_chunk = 0.0
-        t_first_audio_ready = 0.0
-
-        for idx, sentence in enumerate(sentences):
-            t_tts_chunk_start = time.perf_counter()
+        # Flush any trailing text that never reached a sentence boundary
+        trailing = pending_buffer.strip()
+        if trailing:
+            if "gemma_first_sentence_s" not in timings:
+                timings["gemma_first_sentence_s"] = round(time.perf_counter() - t_request_start, 3)
             try:
-                tts_response = http_session.post(TTS_URL, json={"text": sentence}, timeout=120)
-                tts_response.raise_for_status()
-                tts_result = tts_response.json()
-                audio_b64 = tts_result.get("audio_b64")
-                sample_rate = tts_result.get("sample_rate", 22050)
-                t_tts_chunk_elapsed = time.perf_counter() - t_tts_chunk_start
-
-                if not first_audio_ready:
-                    first_audio_ready = True
-                    t_tts_first_chunk = t_tts_chunk_elapsed
-                    t_first_audio_ready = time.perf_counter() - t_request_start
-                    print(f"[TIMING] TTS_FIRST_CHUNK: {t_tts_first_chunk:.3f}s")
-                    print(f"[TIMING] FIRST_AUDIO_READY: {t_first_audio_ready:.3f}s")
-
-                chunk_payload = {
-                    "type": "audio_chunk",
-                    "chunk_index": idx,
-                    "total_chunks": len(sentences),
-                    "sentence": sentence,
-                    "audio_b64": audio_b64,
-                    "sample_rate": sample_rate,
-                    "tts_time_s": round(t_tts_chunk_elapsed, 3),
-                    "first_audio_latency_s": round(t_first_audio_ready, 3)
-                }
+                chunk_payload = synthesize_sentence(trailing)
                 yield f"data: {json.dumps(chunk_payload)}\n\n"
-
             except Exception as e:
-                print(f"TTS CHUNK {idx} ERROR:", e)
-                yield f"data: {json.dumps({'type': 'tts_chunk_error', 'chunk_index': idx, 'error': str(e)})}\n\n"
+                print(f"TTS CHUNK {chunk_index} ERROR:", e)
+                yield f"data: {json.dumps({'type': 'tts_chunk_error', 'chunk_index': chunk_index, 'error': str(e)})}\n\n"
+
+        reply = "".join(reply_parts).strip()
+        t_gemma_elapsed = timings.get("gemma_total_s", round(time.perf_counter() - t_request_start, 3))
+        print(f"[TIMING] GEMMA_TOTAL: {t_gemma_elapsed:.3f}s")
+        print(f"[TIMING] GEMMA_GENUINELY_STREAMING: {timings.get('gemma_genuinely_streaming', False)} "
+              f"({timings.get('gemma_chunk_count', 0)} chunk(s) received)")
+        yield f"data: {json.dumps({'type': 'gemma_final', 'reply': reply, 'tts_text': reply, 'gemma_time_s': t_gemma_elapsed})}\n\n"
 
         t_agent_total = time.perf_counter() - t_request_start
         print(f"[TIMING] AGENT_TOTAL: {t_agent_total:.3f}s")
@@ -480,12 +627,15 @@ async def chat_stream(
             "session_id": session_id,
             "transcript": active_transcript,
             "reply": reply,
-            "tts_text": tts_text,
-            "total_chunks": len(sentences),
+            "tts_text": reply,
+            "total_chunks": chunk_index,
             "timings": {
                 "asr_s": round(t_asr, 3),
-                "gemma_s": round(t_gemma_elapsed, 3),
-                "gemma_first_sentence_s": round(t_gemma_first_sentence, 3),
+                "gemma_first_token_s": timings.get("gemma_first_token_s"),
+                "gemma_first_text_chunk_s": timings.get("gemma_first_text_chunk_s"),
+                "gemma_first_sentence_s": timings.get("gemma_first_sentence_s"),
+                "gemma_s": t_gemma_elapsed,
+                "gemma_genuinely_streaming": timings.get("gemma_genuinely_streaming", False),
                 "tts_first_chunk_s": round(t_tts_first_chunk, 3),
                 "first_audio_ready_s": round(t_first_audio_ready, 3),
                 "agent_total_s": round(t_agent_total, 3)
