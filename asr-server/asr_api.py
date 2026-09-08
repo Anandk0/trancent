@@ -1,7 +1,9 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
-import tempfile
 
+import time
+import subprocess
+import numpy as np
 import torch
 import torchaudio
 
@@ -14,11 +16,13 @@ from transformers import AutoModel
 # ============================================================
 
 MODEL_ID = "ai4bharat/indic-conformer-600m-multilingual"
-
 TARGET_SAMPLE_RATE = 16000
-
-# Default language
 DEFAULT_LANGUAGE = "hi"
+
+# Optimize CPU threads for PyTorch/ONNX inference
+num_cpus = os.cpu_count() or 4
+torch.set_num_threads(min(num_cpus, 8))
+
 
 # ============================================================
 # APP
@@ -67,29 +71,23 @@ SUPPORTED_LANGUAGES = {
 # ============================================================
 
 def load_asr():
-
     global asr_model
 
     if asr_model is not None:
         return asr_model
 
     print("=" * 60)
-    print("Loading Indic Conformer")
+    print("Loading Indic Conformer (CPU)")
     print("=" * 60)
-
     print("Model:", MODEL_ID)
-    print("CUDA available:", torch.cuda.is_available())
-
-    if torch.cuda.is_available():
-        print("GPU:", torch.cuda.get_device_name(0))
 
     asr_model = AutoModel.from_pretrained(
         MODEL_ID,
         trust_remote_code=True,
     )
+    asr_model.eval()
 
     print("Indic Conformer loaded successfully.")
-
     return asr_model
 
 
@@ -99,7 +97,6 @@ def load_asr():
 
 @app.on_event("startup")
 def startup_event():
-
     load_asr()
 
 
@@ -109,7 +106,6 @@ def startup_event():
 
 @app.get("/health")
 def health():
-
     return {
         "status": "ok",
         "service": "indic-conformer-asr",
@@ -124,7 +120,6 @@ def health():
 
 @app.get("/")
 def root():
-
     return {
         "service": "Indic Conformer ASR",
         "status": "running",
@@ -143,84 +138,50 @@ async def transcribe(
     language: str = Form(DEFAULT_LANGUAGE),
     decoding: str = Form("ctc"),
 ):
+    t_start = time.perf_counter()
 
     print()
     print("=" * 60)
     print("ASR REQUEST")
     print("Filename:", file.filename)
-    print("Content type:", file.content_type)
     print("Language:", language)
     print("Decoding:", decoding)
     print("=" * 60)
 
     # --------------------------------------------------------
-    # Validate language
+    # Validate inputs
     # --------------------------------------------------------
-
     if language not in SUPPORTED_LANGUAGES:
-
         return {
             "status": "error",
             "error": f"Unsupported language: {language}",
             "supported_languages": SUPPORTED_LANGUAGES,
         }
 
-    # --------------------------------------------------------
-    # Validate decoding
-    # --------------------------------------------------------
-
     if decoding not in ["ctc", "rnnt"]:
-
         return {
             "status": "error",
             "error": "decoding must be either 'ctc' or 'rnnt'",
         }
 
     # --------------------------------------------------------
-    # Save uploaded file
+    # Direct In-Memory Read and FFmpeg Pipe Decode
     # --------------------------------------------------------
+    data = await file.read()
+    if not data:
+        return {
+            "status": "error",
+            "error": "Empty audio data received"
+        }
 
-    suffix = os.path.splitext(file.filename or ".wav")[1]
-
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=suffix,
-    ) as tmp:
-
-        data = await file.read()
-
-        tmp.write(data)
-
-        audio_path = tmp.name
-
-    print("Audio saved:", audio_path)
-
+    t_decode_start = time.perf_counter()
     try:
-
-        # ----------------------------------------------------
-        # Load model
-        # ----------------------------------------------------
-
-        model = load_asr()
-
-        # ----------------------------------------------------
-        # Load audio
-        # ----------------------------------------------------
-
-        print("Loading audio...")
-
-        # ----------------------------------------------------
-        # Decode and resample audio using FFmpeg
-        # ----------------------------------------------------
-
-        print("Decoding audio with FFmpeg...")
-
-        import subprocess
-        import numpy as np
-
+        # Decode directly from memory via pipe:0 (avoids disk tempfile write & read)
         ffmpeg_command = [
             "ffmpeg",
-            "-i", audio_path,
+            "-y",
+            "-loglevel", "error",
+            "-i", "pipe:0",
             "-ar", str(TARGET_SAMPLE_RATE),
             "-ac", "1",
             "-f", "f32le",
@@ -229,62 +190,43 @@ async def transcribe(
 
         result = subprocess.run(
             ffmpeg_command,
+            input=data,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=True,
         )
 
-        # FFmpeg returns raw float32 PCM
         audio_np = np.frombuffer(
             result.stdout,
             dtype=np.float32,
         )
 
-        # Convert to PyTorch tensor
         wav = torch.from_numpy(audio_np).unsqueeze(0)
-
-        print("Final audio shape:", tuple(wav.shape))
-        print("Final sample rate:", TARGET_SAMPLE_RATE)
-
-        print("Final audio shape:", tuple(wav.shape))
-        print("Final sample rate:", TARGET_SAMPLE_RATE)
+        t_decode_elapsed = time.perf_counter() - t_decode_start
 
         # ----------------------------------------------------
-        # Move tensor to correct device if necessary
+        # Run ASR Inference
         # ----------------------------------------------------
+        model = load_asr()
+        t_infer_start = time.perf_counter()
 
-        # The Indic Conformer ONNX implementation handles
-        # its own execution providers.
-        #
-        # Keep audio tensor on CPU.
-
-        # ----------------------------------------------------
-        # RUN ASR
-        # ----------------------------------------------------
-
-        print("Running ASR...")
-
-        with torch.no_grad():
-
+        with torch.inference_mode():
             transcription = model(
                 wav,
                 language,
                 decoding,
             )
 
-        # ----------------------------------------------------
-        # Normalize output
-        # ----------------------------------------------------
+        t_infer_elapsed = time.perf_counter() - t_infer_start
 
         if isinstance(transcription, (list, tuple)):
-
             transcription = transcription[0]
+        transcription = str(transcription).strip()
 
-        transcription = str(transcription)
+        t_total = time.perf_counter() - t_start
 
-        print("TRANSCRIPTION:")
-        print(transcription)
-
+        print(f"[TIMING] ASR_DECODE: {t_decode_elapsed:.3f}s | ASR_INFER: {t_infer_elapsed:.3f}s | TOTAL: {t_total:.3f}s")
+        print(f"TRANSCRIPTION: '{transcription}'")
         print("=" * 60)
 
         return {
@@ -295,15 +237,16 @@ async def transcribe(
             "decoding": decoding,
             "sample_rate": TARGET_SAMPLE_RATE,
             "text": transcription,
+            "timings": {
+                "decode_s": round(t_decode_elapsed, 3),
+                "infer_s": round(t_infer_elapsed, 3),
+                "total_s": round(t_total, 3)
+            }
         }
 
     except Exception as e:
-
-        print()
         print("=" * 60)
-        print("ASR ERROR")
-        print(type(e).__name__)
-        print(str(e))
+        print("ASR ERROR:", type(e).__name__, str(e))
         print("=" * 60)
 
         return {
@@ -312,24 +255,12 @@ async def transcribe(
             "error": str(e),
         }
 
-    finally:
-
-        # ----------------------------------------------------
-        # Delete temporary file
-        # ----------------------------------------------------
-
-        try:
-            os.remove(audio_path)
-        except Exception:
-            pass
-
 
 # ============================================================
 # MAIN
 # ============================================================
 
 if __name__ == "__main__":
-
     import uvicorn
 
     uvicorn.run(

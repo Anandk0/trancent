@@ -1,3 +1,5 @@
+import io
+import base64
 import torch
 import soundfile as sf
 
@@ -13,12 +15,17 @@ HOST = "0.0.0.0"
 PORT = 8003
 OUTPUT_PATH = "/tmp/tts_output.wav"
 
-app = FastAPI(title="Indic Parler TTS")
+DIVYA_DESCRIPTION = (
+    "Divya's voice is monotone yet slightly fast in delivery, "
+    "with a very close recording that almost has no background noise."
+)
 
+app = FastAPI(title="Indic Parler TTS")
 
 model = None
 tokenizer = None
 description_tokenizer = None
+cached_description_inputs = None
 
 
 class TTSRequest(BaseModel):
@@ -29,6 +36,7 @@ def load_model():
     global model
     global tokenizer
     global description_tokenizer
+    global cached_description_inputs
 
     print("Loading Indic Parler TTS...")
 
@@ -47,6 +55,7 @@ def load_model():
         model.config.text_encoder._name_or_path
     )
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     if torch.cuda.is_available():
         model = model.to("cuda")
         print("Using GPU:", torch.cuda.get_device_name(0))
@@ -55,9 +64,18 @@ def load_model():
 
     model.eval()
 
-    print("Model loaded")
-    print("Description tokenizer:",
-          model.config.text_encoder._name_or_path)
+    # Pre-tokenize Divya description once at startup to avoid repeated tokenization overhead
+    print("Pre-caching Divya description tokens...")
+    desc_inputs = description_tokenizer(
+        DIVYA_DESCRIPTION,
+        return_tensors="pt"
+    )
+    if torch.cuda.is_available():
+        desc_inputs = {k: v.to("cuda") for k, v in desc_inputs.items()}
+    cached_description_inputs = desc_inputs
+
+    print("Model and description cache ready.")
+    print("Description tokenizer:", model.config.text_encoder._name_or_path)
 
 
 @app.on_event("startup")
@@ -76,6 +94,7 @@ def health():
 
 @app.post("/synthesize")
 def synthesize(request: TTSRequest):
+    global cached_description_inputs
 
     text = request.text.strip()
 
@@ -85,77 +104,64 @@ def synthesize(request: TTSRequest):
             "message": "Text cannot be empty"
         }
 
-    # Keep this extremely simple for the first test.
-    # This is the official Divya speaker conditioning.
-    description = (
-        "Divya's voice is monotone yet slightly fast in delivery, "
-        "with a very close recording that almost has no background noise."
-    )
+    print("\n" + "=" * 40)
+    print("TTS TEXT:", text)
+    print("=" * 40)
 
-    print("\n==============================")
-    print("TEXT:")
-    print(text)
-    print("\nDESCRIPTION:")
-    print(description)
-    print("==============================")
+    # Ensure cached description inputs are loaded
+    if cached_description_inputs is None:
+        desc_inputs = description_tokenizer(
+            DIVYA_DESCRIPTION,
+            return_tensors="pt"
+        )
+        if torch.cuda.is_available():
+            desc_inputs = {k: v.to("cuda") for k, v in desc_inputs.items()}
+        cached_description_inputs = desc_inputs
 
-    # Description tokenizer
-    description_inputs = description_tokenizer(
-        description,
-        return_tensors="pt"
-    )
-
-    # Speech/text tokenizer
+    # Tokenize user text prompt
     prompt_inputs = tokenizer(
         text,
         return_tensors="pt"
     )
-
     if torch.cuda.is_available():
+        prompt_inputs = {k: v.to("cuda") for k, v in prompt_inputs.items()}
 
-        description_inputs = {
-            key: value.to("cuda")
-            for key, value in description_inputs.items()
-        }
-
-        prompt_inputs = {
-            key: value.to("cuda")
-            for key, value in prompt_inputs.items()
-        }
-
-    print("Generating...")
-
-    with torch.no_grad():
-
+    with torch.inference_mode():
         generation = model.generate(
-            input_ids=description_inputs["input_ids"],
-            attention_mask=description_inputs["attention_mask"],
+            input_ids=cached_description_inputs["input_ids"],
+            attention_mask=cached_description_inputs["attention_mask"],
             prompt_input_ids=prompt_inputs["input_ids"],
             prompt_attention_mask=prompt_inputs["attention_mask"]
         )
 
     audio = generation.cpu().float().numpy().squeeze()
+    sample_rate = model.config.sampling_rate
 
-    sf.write(
-        OUTPUT_PATH,
-        audio,
-        model.config.sampling_rate
-    )
+    # Generate in-memory WAV and base64
+    buffer = io.BytesIO()
+    sf.write(buffer, audio, sample_rate, format="WAV")
+    audio_bytes = buffer.getvalue()
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
-    print("Generated:", OUTPUT_PATH)
-    print("Sample rate:", model.config.sampling_rate)
-    print("Audio samples:", len(audio))
+    # Also write to OUTPUT_PATH for backward compatibility
+    try:
+        with open(OUTPUT_PATH, "wb") as f:
+            f.write(audio_bytes)
+    except Exception as e:
+        print("[WARN] Could not write temp WAV file:", e)
+
+    print("Synthesized audio bytes:", len(audio_bytes), "sample_rate:", sample_rate)
 
     return {
         "status": "success",
         "text": text,
         "audio_file": OUTPUT_PATH,
-        "sample_rate": model.config.sampling_rate
+        "audio_b64": audio_b64,
+        "sample_rate": sample_rate
     }
 
 
 if __name__ == "__main__":
-
     uvicorn.run(
         app,
         host=HOST,

@@ -10,7 +10,7 @@ import uvicorn
 
 
 # ============================================================
-# SERVICE URLS
+# SERVICE URLS & HTTP SESSION (Connection Pooling)
 # ============================================================
 
 ASR_URL = "http://127.0.0.1:8001/transcribe"
@@ -19,6 +19,12 @@ TTS_URL = "http://127.0.0.1:8003/synthesize"
 
 HOST = "0.0.0.0"
 PORT = 8002
+
+# Persistent HTTP session to reuse connections to local services
+http_session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20)
+http_session.mount("http://", adapter)
+http_session.mount("https://", adapter)
 
 
 app = FastAPI(title="MBA Calling Agent API")
@@ -42,37 +48,31 @@ def health():
 
 # Wraps the user transcript so that one Gemma call returns both
 # the conversational reply and the Devanagari TTS text.
-#
-# The outer instruction is kept minimal so it does not inflate
-# the prompt or confuse the counselor persona.
+# Keep responses concise (1 to 3 sentences) to minimize generation latency.
 
 def build_structured_prompt(transcript: str) -> str:
-    return f"""Respond as the MBA admissions counselor.
+    return f"""You are Divya, the AI admissions counselor for Regular MBA at Jain College of Engineering and Research, Udyambag, Belagavi (VTU affiliated, AICTE approved).
 
-Reply to the student's message below.
+Respond directly to the student's message.
+Keep your response concise, helpful, and natural for a phone call (1 to 3 sentences maximum).
 
-Return your response as a single JSON object with exactly two keys:
-- "reply": your natural conversational response (same language style as the student)
-- "tts_text": the same response written entirely in Devanagari script for a Hindi TTS system
+Return your response as a single valid JSON object with exactly two keys:
+- "reply": your natural conversational response matching the student's language style (English, Hindi, or Hinglish).
+- "tts_text": the exact same response written in Devanagari script for the Hindi TTS voice.
 
 Rules for tts_text:
-- If the reply is Hindi or Hinglish, write the ENTIRE tts_text in Devanagari.
-- Romanized Hindi words must be converted to natural Devanagari.
-- English professional terms spoken in a Hindi/Hinglish context must be written phonetically in Devanagari.
-- Do NOT leave English words in Latin letters inside tts_text when the reply is Hindi/Hinglish.
-- If the reply is fully in English, tts_text may remain in English.
-- Do NOT add punctuation around individual English-derived Devanagari words.
-- Preserve natural sentence flow so the TTS sounds like a real phone call.
+- If the reply is in Hindi or Hinglish, write the ENTIRE tts_text in Devanagari script.
+- English professional words in Hindi/Hinglish must be written phonetically in Devanagari (e.g., MBA → एमबीए, HR → एचआर, Finance → फाइनेंस, Marketing → मार्केटिंग, Placement → प्लेसमेंट, Admission → एडमिशन, Specialization → स्पेशलाइज़ेशन, Business Analytics → बिज़नेस एनालिटिक्स).
+- If the reply is purely in English, tts_text can remain in English.
+- Do NOT include unnecessary punctuation around English words.
 
-Examples of phonetic Devanagari for common terms:
-MBA → एमबीए, HR → एचआर, Finance → फाइनेंस, Marketing → मार्केटिंग,
-Placement → प्लेसमेंट, Admission → एडमिशन, Specialization → स्पेशलाइज़ेशन,
-Business Analytics → बिज़नेस एनालिटिक्स
+Specializations available: Marketing, Finance, Human Resource Management, Business Analytics.
+Do NOT invent fees, placement percentages, salary figures, recruiter names, or unverified deadlines.
 
-Return ONLY the JSON object. No markdown. No code fences. No explanation.
+Return ONLY the JSON object. No extra text, no markdown backticks.
 
 Example output:
-{{"reply": "Haan, MBA ka duration do saal ka hai.", "tts_text": "हाँ, एमबीए का ड्यूरेशन दो साल का है।"}}
+{{"reply": "Haan, MBA ka duration 2 saal ka hai. Aap kaunsi specialization mein interested hain?", "tts_text": "हाँ, एमबीए का ड्यूरेशन 2 साल का है। आप कौनसी स्पेशलाइज़ेशन में इंटरेस्टेड हैं?"}}
 
 Student message:
 {transcript}"""
@@ -85,44 +85,42 @@ Student message:
 def parse_gemma_json(raw: str, fallback_reply: str = "") -> tuple:
     """
     Parse the JSON object from Gemma's raw output.
-
     Returns (reply, tts_text).
-
-    Handles:
-    - Clean JSON
-    - JSON wrapped in markdown code fences (with or without surrounding text)
-    - Partial/malformed JSON where only reply is present
-
-    Fallback (no second Gemma call):
-    - If tts_text is missing, use reply as tts_text.
-    - If reply is missing, use fallback_reply.
-    - Never raises; always returns two strings.
     """
     if not raw or not raw.strip():
         return fallback_reply, fallback_reply
 
     text = raw.strip()
-    candidates = [text]
 
-    # If wrapped in markdown code fences anywhere in text
-    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
-    if fence_match:
-        candidates.insert(0, fence_match.group(1).strip())
+    # Strip markdown code fences if present e.g. ```json ... ``` or ``` ... ```
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    text = text.strip()
 
-    # If there's an explicit JSON object {...} in text
+    # 1. Try standard JSON parse
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            reply = str(data.get("reply", "") or "").strip()
+            tts_text = str(data.get("tts_text", "") or "").strip()
+
+            if not reply:
+                reply = fallback_reply
+            if not tts_text:
+                tts_text = reply
+
+            return reply, tts_text
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+
+    # 2. Try extracting JSON object substring {...}
     brace_match = re.search(r"(\{[\s\S]*\})", text)
     if brace_match:
-        candidates.insert(0, brace_match.group(1).strip())
-
-    for candidate in candidates:
         try:
-            data = json.loads(candidate)
+            data = json.loads(brace_match.group(1))
             if isinstance(data, dict):
                 reply = str(data.get("reply", "") or "").strip()
                 tts_text = str(data.get("tts_text", "") or "").strip()
-
-                if not reply and not tts_text:
-                    continue
 
                 if not reply:
                     reply = fallback_reply
@@ -130,10 +128,10 @@ def parse_gemma_json(raw: str, fallback_reply: str = "") -> tuple:
                     tts_text = reply
 
                 return reply, tts_text
-        except (json.JSONDecodeError, ValueError, TypeError):
-            continue
+        except Exception:
+            pass
 
-    # JSON parse failed — try regex extraction for "reply" and "tts_text"
+    # 3. Try regex extraction for "reply" and "tts_text"
     reply_match = re.search(r'"reply"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
     tts_match = re.search(r'"tts_text"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
 
@@ -142,7 +140,6 @@ def parse_gemma_json(raw: str, fallback_reply: str = "") -> tuple:
 
     if reply_match:
         reply = reply_match.group(1).replace('\\"', '"').replace('\\n', ' ').strip()
-
     if tts_match:
         tts_text = tts_match.group(1).replace('\\"', '"').replace('\\n', ' ').strip()
 
@@ -151,13 +148,12 @@ def parse_gemma_json(raw: str, fallback_reply: str = "") -> tuple:
             reply = fallback_reply
         if not tts_text:
             tts_text = reply
-        print("[WARN] JSON parse failed; extracted fields via regex.")
+        print("[WARN] JSON parse recovered fields via regex.")
         return reply, tts_text
 
-    # Complete parse failure — return the raw text as both fields
-    # so the call does not crash.
+    # Complete fallback
     reply = text or fallback_reply
-    print("[WARN] JSON parse completely failed; using raw Gemma output as reply and tts_text.")
+    print("[WARN] JSON parse failed; using raw Gemma output.")
     return reply, reply
 
 
@@ -171,43 +167,31 @@ async def chat(
     session_id: str = Form(None),
     language: str = Form("hi")
 ):
-
-    # --------------------------------------------------------
-    # CREATE SESSION
-    # --------------------------------------------------------
-
     if not session_id:
         session_id = str(uuid.uuid4())
 
     t_request_start = time.perf_counter()
 
-    print("\n")
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("NEW CHAT REQUEST")
     print("Session:", session_id)
     print("=" * 60)
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # 1. AUDIO → ASR
-    # ========================================================
-
+    # --------------------------------------------------------
     print("\n[1/3] Sending audio to ASR...")
-
     t_read_start = time.perf_counter()
     audio_data = await file.read()
     t_read_elapsed = time.perf_counter() - t_read_start
-    print(f"[TIMING] AUDIO_READ: {t_read_elapsed:.3f}s  ({len(audio_data)} bytes)")
 
     t_asr_start = time.perf_counter()
-
     try:
-
-        asr_response = requests.post(
+        asr_response = http_session.post(
             ASR_URL,
             files={
                 "file": (
-                    file.filename,
+                    file.filename or "audio.wav",
                     audio_data,
                     file.content_type or "audio/wav"
                 )
@@ -218,15 +202,10 @@ async def chat(
             },
             timeout=120
         )
-
         asr_response.raise_for_status()
-
         asr_result = asr_response.json()
-
     except Exception as e:
-
         print("ASR ERROR:", e)
-
         return JSONResponse(
             status_code=500,
             content={
@@ -237,16 +216,11 @@ async def chat(
         )
 
     t_asr_elapsed = time.perf_counter() - t_asr_start
-    print(f"[TIMING] ASR: {t_asr_elapsed:.3f}s")
-
     transcript = asr_result.get("text", "").strip()
+    print(f"[TIMING] ASR: {t_asr_elapsed:.3f}s -> Transcript: '{transcript}'")
 
-    print("ASR transcript:", transcript)
-
-
-    # Empty transcript
+    # Empty transcript handling
     if not transcript:
-
         return {
             "status": "success",
             "session_id": session_id,
@@ -254,23 +228,19 @@ async def chat(
             "transcript": "",
             "reply": "",
             "tts_text": "",
-            "audio_file": None
+            "audio_file": None,
+            "audio_b64": None
         }
 
-
-    # ========================================================
-    # 2. TRANSCRIPT → GEMMA (single call, structured output)
-    # ========================================================
-
+    # --------------------------------------------------------
+    # 2. TRANSCRIPT → GEMMA (Single-Pass Structured Output)
+    # --------------------------------------------------------
     print("\n[2/3] Sending transcript to Gemma...")
-
     structured_prompt = build_structured_prompt(transcript)
 
     t_gemma_start = time.perf_counter()
-
     try:
-
-        gemma_response = requests.post(
+        gemma_response = http_session.post(
             GEMMA_URL,
             json={
                 "session_id": session_id,
@@ -278,15 +248,10 @@ async def chat(
             },
             timeout=120
         )
-
         gemma_response.raise_for_status()
-
         gemma_result = gemma_response.json()
-
     except Exception as e:
-
         print("GEMMA ERROR:", e)
-
         return JSONResponse(
             status_code=500,
             content={
@@ -298,45 +263,30 @@ async def chat(
         )
 
     t_gemma_elapsed = time.perf_counter() - t_gemma_start
-    print(f"[TIMING] GEMMA: {t_gemma_elapsed:.3f}s")
-
     raw_gemma = gemma_result.get("reply", "").strip()
-
-    print("Gemma raw output:")
-    print(raw_gemma)
-
     reply, tts_text = parse_gemma_json(raw_gemma, fallback_reply=transcript)
 
-    print("reply:", reply)
-    print("tts_text:", tts_text)
+    print(f"[TIMING] GEMMA: {t_gemma_elapsed:.3f}s")
+    print(f"  Reply:    '{reply}'")
+    print(f"  TTS text: '{tts_text}'")
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # 3. DEVANAGARI → PARLER TTS
-    # ========================================================
-
+    # --------------------------------------------------------
     print("\n[3/3] Sending text to Parler TTS...")
-
     t_tts_start = time.perf_counter()
-
     try:
-
-        tts_response = requests.post(
+        tts_response = http_session.post(
             TTS_URL,
             json={
                 "text": tts_text
             },
             timeout=120
         )
-
         tts_response.raise_for_status()
-
         tts_result = tts_response.json()
-
     except Exception as e:
-
         print("TTS ERROR:", e)
-
         return JSONResponse(
             status_code=500,
             content={
@@ -351,28 +301,22 @@ async def chat(
         )
 
     t_tts_elapsed = time.perf_counter() - t_tts_start
-    print(f"[TIMING] TTS: {t_tts_elapsed:.3f}s")
-
     audio_file = tts_result.get("audio_file")
-
-    print("Audio file:", audio_file)
+    audio_b64 = tts_result.get("audio_b64")
+    sample_rate = tts_result.get("sample_rate", 22050)
 
     t_total = time.perf_counter() - t_request_start
 
-    print("\n")
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("REQUEST COMPLETE")
-    print(f"[TIMING] AUDIO_READ:  {t_read_elapsed:.3f}s")
-    print(f"[TIMING] ASR:         {t_asr_elapsed:.3f}s")
-    print(f"[TIMING] GEMMA:       {t_gemma_elapsed:.3f}s")
-    print(f"[TIMING] TTS:         {t_tts_elapsed:.3f}s")
-    print(f"[TIMING] AGENT_TOTAL: {t_total:.3f}s")
-    print("=" * 60)
-
-
-    # ========================================================
-    # FINAL RESPONSE
-    # ========================================================
+    print(f"Session:     {session_id}")
+    print(f"Audio bytes: {len(audio_data)}")
+    print(f"ASR:         {t_asr_elapsed:.3f} s")
+    print(f"Gemma:       {t_gemma_elapsed:.3f} s")
+    print(f"TTS:         {t_tts_elapsed:.3f} s")
+    print(f"I/O:         {t_read_elapsed:.3f} s")
+    print(f"TOTAL:       {t_total:.3f} s")
+    print("=" * 60 + "\n")
 
     return {
         "status": "success",
@@ -381,7 +325,15 @@ async def chat(
         "transcript": transcript,
         "reply": reply,
         "tts_text": tts_text,
-        "audio_file": audio_file
+        "audio_file": audio_file,
+        "audio_b64": audio_b64,
+        "sample_rate": sample_rate,
+        "timings": {
+            "asr_s": round(t_asr_elapsed, 3),
+            "gemma_s": round(t_gemma_elapsed, 3),
+            "tts_s": round(t_tts_elapsed, 3),
+            "total_s": round(t_total, 3)
+        }
     }
 
 
@@ -390,7 +342,6 @@ async def chat(
 # ============================================================
 
 if __name__ == "__main__":
-
     uvicorn.run(
         app,
         host=HOST,

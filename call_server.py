@@ -9,11 +9,16 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 
 AGENT_URL = "http://127.0.0.1:8002/chat"
-
 HOST = "0.0.0.0"
 PORT = 8080
 
 app = FastAPI(title="MBA Call Browser Interface")
+
+# Persistent HTTP session for fast localhost forwarding
+http_session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20)
+http_session.mount("http://", adapter)
+http_session.mount("https://", adapter)
 
 
 # ============================================================
@@ -36,28 +41,22 @@ def index():
 
 # ============================================================
 # PROCESS ENDPOINT
-# Browser POSTs raw WAV bytes here.
+# Browser POSTs raw audio bytes here.
 # Returns base64-encoded WAV audio from Divya.
 # ============================================================
 
 @app.post("/process")
 async def process(request: Request):
-
     t_request_start = time.perf_counter()
 
-    print("\n")
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("CALL SERVER: NEW REQUEST")
 
-    # --------------------------------------------------------
-    # Read raw audio bytes from browser
-    # --------------------------------------------------------
-
+    # 1. Read raw audio bytes from browser
     t_read_start = time.perf_counter()
     audio_bytes = await request.body()
     t_read_elapsed = time.perf_counter() - t_read_start
-
-    print(f"[TIMING] BROWSER_AUDIO_READ: {t_read_elapsed:.3f}s  ({len(audio_bytes)} bytes)")
+    print(f"[TIMING] BROWSER_AUDIO_READ: {t_read_elapsed:.3f}s ({len(audio_bytes)} bytes)")
 
     if not audio_bytes:
         return JSONResponse(
@@ -68,14 +67,10 @@ async def process(request: Request):
     session_id = request.headers.get("X-Session-Id", str(uuid.uuid4()))
     print("Session:", session_id)
 
-    # --------------------------------------------------------
-    # Forward audio to agent_api /chat
-    # --------------------------------------------------------
-
+    # 2. Forward audio to agent_api /chat
     t_agent_start = time.perf_counter()
-
     try:
-        agent_response = requests.post(
+        agent_response = http_session.post(
             AGENT_URL,
             files={
                 "file": ("audio.wav", audio_bytes, "audio/wav")
@@ -88,7 +83,6 @@ async def process(request: Request):
         )
         agent_response.raise_for_status()
         agent_result = agent_response.json()
-
     except Exception as e:
         print("AGENT ERROR:", e)
         return JSONResponse(
@@ -99,28 +93,23 @@ async def process(request: Request):
     t_agent_elapsed = time.perf_counter() - t_agent_start
     print(f"[TIMING] AGENT_ROUNDTRIP: {t_agent_elapsed:.3f}s")
 
-    # --------------------------------------------------------
-    # Read generated WAV file and encode as base64
-    # --------------------------------------------------------
-
-    audio_file = agent_result.get("audio_file")
-
+    # 3. Get base64 audio (in-memory direct pass-through, or fallback to file)
     t_encode_start = time.perf_counter()
+    audio_b64 = agent_result.get("audio_b64")
 
-    audio_b64 = None
-    if audio_file:
-        try:
-            with open(audio_file, "rb") as f:
-                audio_b64 = base64.b64encode(f.read()).decode("utf-8")
-        except Exception as e:
-            print("Audio file read error:", e)
+    if not audio_b64:
+        audio_file = agent_result.get("audio_file")
+        if audio_file:
+            try:
+                with open(audio_file, "rb") as f:
+                    audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+            except Exception as e:
+                print("Audio file read error:", e)
 
     t_encode_elapsed = time.perf_counter() - t_encode_start
-    print(f"[TIMING] FILE_READ_ENCODE: {t_encode_elapsed:.3f}s")
-
     t_total = time.perf_counter() - t_request_start
 
-    print(f"[TIMING] CALL_SERVER_TOTAL: {t_total:.3f}s")
+    print(f"[TIMING] AUDIO_PREP: {t_encode_elapsed:.3f}s | TOTAL: {t_total:.3f}s")
     print("=" * 60)
 
     return JSONResponse(content={
@@ -129,19 +118,16 @@ async def process(request: Request):
         "transcript": agent_result.get("transcript", ""),
         "reply": agent_result.get("reply", ""),
         "audio_b64": audio_b64,
-        "sample_rate": 22050
+        "sample_rate": agent_result.get("sample_rate", 22050),
+        "timings": {
+            "server_total_s": round(t_total, 3),
+            "agent_roundtrip_s": round(t_agent_elapsed, 3)
+        }
     })
 
 
 # ============================================================
 # BROWSER PAGE
-# Single-page call interface with:
-# - browser microphone via MediaRecorder
-# - RMS-based voice activity detection
-# - silence detection (~1.2 s)
-# - HTTP POST to /process
-# - base64 WAV playback
-# - microphone muted while Divya is speaking
 # ============================================================
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -151,34 +137,43 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Jain MBA Admissions – Divya</title>
 <style>
-  body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; background: #f9f9f9; }
-  h1 { font-size: 1.4em; color: #333; }
-  #status { margin: 16px 0; padding: 12px; border-radius: 8px; background: #eee; font-size: 0.95em; }
-  #status.listening { background: #d4edda; color: #155724; }
-  #status.processing { background: #fff3cd; color: #856404; }
-  #status.speaking { background: #cce5ff; color: #004085; }
-  #status.idle { background: #eee; color: #555; }
-  button { padding: 12px 28px; font-size: 1em; border: none; border-radius: 8px; cursor: pointer; }
-  #startBtn { background: #28a745; color: #fff; }
-  #endBtn   { background: #dc3545; color: #fff; display: none; }
-  #log { margin-top: 20px; font-size: 0.82em; color: #555; white-space: pre-wrap; max-height: 300px; overflow-y: auto; background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #ddd; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 640px; margin: 30px auto; padding: 24px; background: #f8fafc; color: #1e293b; }
+  .card { background: #ffffff; border-radius: 12px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -2px rgba(0,0,0,0.05); }
+  h1 { font-size: 1.35em; margin-top: 0; color: #0f172a; }
+  .subtitle { font-size: 0.9em; color: #64748b; margin-bottom: 20px; }
+  #status { margin: 16px 0; padding: 14px 18px; border-radius: 8px; font-weight: 500; font-size: 0.95em; transition: all 0.2s ease; }
+  #status.listening { background: #dcfce7; color: #15803d; border-left: 4px solid #22c55e; }
+  #status.processing { background: #fef9c3; color: #a16207; border-left: 4px solid #eab308; }
+  #status.speaking { background: #dbeafe; color: #1d4ed8; border-left: 4px solid #3b82f6; }
+  #status.idle { background: #f1f5f9; color: #64748b; }
+  .btn-group { display: flex; gap: 12px; margin-top: 16px; }
+  button { padding: 12px 24px; font-size: 1em; font-weight: 600; border: none; border-radius: 8px; cursor: pointer; transition: opacity 0.15s; }
+  button:hover { opacity: 0.9; }
+  #startBtn { background: #16a34a; color: #fff; }
+  #endBtn   { background: #dc2626; color: #fff; display: none; }
+  .metrics { margin-top: 14px; font-size: 0.85em; color: #475569; }
+  #log { margin-top: 20px; font-size: 0.82em; color: #334155; white-space: pre-wrap; max-height: 320px; overflow-y: auto; background: #f8fafc; padding: 14px; border-radius: 8px; border: 1px solid #e2e8f0; font-family: monospace; }
 </style>
 </head>
 <body>
-<h1>📞 Jain College MBA Admissions</h1>
-<p>AI Admission Counselor – Divya</p>
+<div class="card">
+  <h1>📞 Jain College MBA Admissions</h1>
+  <div class="subtitle">AI Telephony Admission Counselor – Divya (Fast Latency Pipeline)</div>
 
-<button id="startBtn" onclick="startCall()">📞 Start Call</button>
-<button id="endBtn"   onclick="endCall()">🔴 End Call</button>
+  <div class="btn-group">
+    <button id="startBtn" onclick="startCall()">📞 Start Call</button>
+    <button id="endBtn"   onclick="endCall()">🔴 End Call</button>
+  </div>
 
-<div id="status" class="idle">Press Start Call to begin.</div>
-<div id="log"></div>
+  <div id="status" class="idle">Press "Start Call" to begin speaking with Divya.</div>
+  <div id="log"></div>
+</div>
 
 <script>
-const SILENCE_MS       = 1200;   // ms of silence before sending
-const RMS_THRESHOLD    = 0.012;  // voice activity threshold
+const SILENCE_MS       = 1050;   // Snappy ~1.05s silence window for natural conversational turn-taking
+const RMS_THRESHOLD    = 0.012;  // Voice activity detection sensitivity
 const SAMPLE_RATE      = 16000;
-const CHUNK_MS         = 100;    // analyser poll interval
+const CHUNK_MS         = 80;     // Analyser poll interval
 
 let mediaStream        = null;
 let audioContext       = null;
@@ -193,7 +188,7 @@ let sessionId          = null;
 
 function log(msg) {
   const el = document.getElementById("log");
-  el.textContent += new Date().toLocaleTimeString() + "  " + msg + "\\n";
+  el.textContent += "[" + new Date().toLocaleTimeString() + "] " + msg + "\\n";
   el.scrollTop = el.scrollHeight;
 }
 
@@ -204,23 +199,26 @@ function setStatus(text, cls) {
 }
 
 function generateSessionId() {
-  return "browser-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+  return "call-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
 }
 
 async function startCall() {
   sessionId = generateSessionId();
-  log("Session: " + sessionId);
+  log("Session initiated: " + sessionId);
 
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
   } catch (e) {
-    log("Microphone error: " + e);
+    log("Microphone access error: " + e);
     return;
   }
 
-  audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
-  const source = audioContext.createMediaStreamSource(mediaStream);
+  audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+  if (audioContext.state === "suspended") {
+    await audioContext.resume();
+  }
 
+  const source = audioContext.createMediaStreamSource(mediaStream);
   analyser = audioContext.createAnalyser();
   analyser.fftSize = 512;
   source.connect(analyser);
@@ -229,8 +227,8 @@ async function startCall() {
   document.getElementById("startBtn").style.display = "none";
   document.getElementById("endBtn").style.display   = "inline-block";
 
-  setStatus("🎙️ Listening...", "listening");
-  log("Call started.");
+  setStatus("🎙️ Listening... (Speak now)", "listening");
+  log("Call connected. Listening for speech...");
 
   startListening();
 }
@@ -252,10 +250,14 @@ function startListening() {
   recordedChunks = [];
   speaking       = false;
 
-  mediaRecorder = new MediaRecorder(mediaStream);
-  mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
-  mediaRecorder.onstop = onRecordingStop;
-  mediaRecorder.start(100);
+  try {
+    mediaRecorder = new MediaRecorder(mediaStream);
+    mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = onRecordingStop;
+    mediaRecorder.start(CHUNK_MS);
+  } catch (e) {
+    log("MediaRecorder start error: " + e);
+  }
 
   pollVAD();
 }
@@ -281,7 +283,7 @@ function pollVAD() {
     if (!speaking) {
       speaking = true;
       clearTimeout(silenceTimer);
-      log("Voice detected (RMS " + rms.toFixed(4) + ")");
+      log("Voice detected (RMS: " + rms.toFixed(4) + ")");
     } else {
       clearTimeout(silenceTimer);
     }
@@ -293,7 +295,7 @@ function pollVAD() {
 
 function onSilence() {
   if (!speaking || !callActive || divyaSpeaking) return;
-  log("Silence detected – sending audio...");
+  log("Silence detected -> sending utterance to backend...");
   stopListening();
 }
 
@@ -304,13 +306,11 @@ function onRecordingStop() {
   }
 
   const blob = new Blob(recordedChunks, { type: "audio/webm" });
-  log("Audio blob: " + blob.size + " bytes");
   sendAudio(blob);
 }
 
 async function sendAudio(blob) {
-  setStatus("⏳ Processing...", "processing");
-
+  setStatus("⏳ Processing response...", "processing");
   const t0 = performance.now();
 
   try {
@@ -325,7 +325,8 @@ async function sendAudio(blob) {
     });
 
     const t1 = performance.now();
-    log("[TIMING] BROWSER_POST_ROUNDTRIP: " + ((t1 - t0) / 1000).toFixed(3) + "s");
+    const roundtrip = ((t1 - t0) / 1000).toFixed(3);
+    log("[TIMING] ROUNDTRIP: " + roundtrip + "s");
 
     if (!response.ok) {
       log("Server error: " + response.status);
@@ -336,21 +337,18 @@ async function sendAudio(blob) {
 
     const data = await response.json();
 
-    if (data.transcript) log("You: " + data.transcript);
-    if (data.reply)      log("Divya: " + data.reply);
+    if (data.transcript) log("Student: " + data.transcript);
+    if (data.reply)      log("Divya:   " + data.reply);
 
     if (data.audio_b64) {
-      const t2 = performance.now();
       await playAudio(data.audio_b64, data.sample_rate || 22050);
-      const t3 = performance.now();
-      log("[TIMING] BROWSER_AUDIO_PLAY: " + ((t3 - t2) / 1000).toFixed(3) + "s");
     } else {
       setStatus("🎙️ Listening...", "listening");
       startListening();
     }
 
   } catch (e) {
-    log("Fetch error: " + e);
+    log("Network fetch error: " + e);
     setStatus("🎙️ Listening...", "listening");
     startListening();
   }
@@ -360,28 +358,40 @@ async function playAudio(b64, sampleRate) {
   divyaSpeaking = true;
   setStatus("🔊 Divya is speaking...", "speaking");
 
-  const binary  = atob(b64);
-  const bytes   = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  try {
+    const binary = atob(b64);
+    const bytes  = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
-  const t_decode_start = performance.now();
-  const decoded = await audioContext.decodeAudioData(bytes.buffer);
-  const t_decode_elapsed = (performance.now() - t_decode_start) / 1000;
-  log("[TIMING] BROWSER_AUDIO_DECODE: " + t_decode_elapsed.toFixed(3) + "s");
+    const t_decode_start = performance.now();
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+    const decoded = await audioContext.decodeAudioData(bytes.buffer);
+    const t_decode_elapsed = ((performance.now() - t_decode_start) / 1000).toFixed(3);
+    log("[TIMING] AUDIO_DECODE: " + t_decode_elapsed + "s");
 
-  const source = audioContext.createBufferSource();
-  source.buffer = decoded;
-  source.connect(audioContext.destination);
+    const source = audioContext.createBufferSource();
+    source.buffer = decoded;
+    source.connect(audioContext.destination);
 
-  source.onended = () => {
+    source.onended = () => {
+      divyaSpeaking = false;
+      if (callActive) {
+        setStatus("🎙️ Listening...", "listening");
+        startListening();
+      }
+    };
+
+    source.start();
+  } catch (err) {
+    log("Audio playback error: " + err);
     divyaSpeaking = false;
     if (callActive) {
       setStatus("🎙️ Listening...", "listening");
       startListening();
     }
-  };
-
-  source.start();
+  }
 }
 </script>
 </body>
