@@ -3,9 +3,10 @@ import json
 import time
 import requests
 import uuid
+from typing import AsyncGenerator
 
 from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 
@@ -22,7 +23,7 @@ PORT = 8002
 
 # Persistent HTTP session to reuse connections to local services
 http_session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20)
+adapter = requests.adapters.HTTPAdapter(pool_connections=15, pool_maxsize=30)
 http_session.mount("http://", adapter)
 http_session.mount("https://", adapter)
 
@@ -38,17 +39,42 @@ app = FastAPI(title="MBA Calling Agent API")
 def health():
     return {
         "status": "ok",
-        "service": "mba-calling-agent"
+        "service": "mba-calling-agent",
+        "endpoints": ["/health", "/chat", "/chat/stream"]
     }
+
+
+# ============================================================
+# TEXT SEGMENTER (Sentence Pipelining for TTS)
+# ============================================================
+
+def split_into_sentences(text: str) -> list[str]:
+    """
+    Split Hindi, Hinglish, and English text into natural sentence / clause chunks
+    suitable for progressive TTS synthesis.
+    Splits on Devanagari danda (।), period (.), question mark (?), exclamation mark (!),
+    or newline, while keeping chunks coherent and natural.
+    """
+    if not text:
+        return []
+    raw_chunks = re.split(r'([।\.\?\!\n]+)', text)
+    sentences = []
+    current = ""
+    for piece in raw_chunks:
+        current += piece
+        if re.search(r'[।\.\?\!\n]', piece):
+            cleaned = current.strip()
+            if cleaned and len(cleaned) > 1:
+                sentences.append(cleaned)
+            current = ""
+    if current.strip():
+        sentences.append(current.strip())
+    return sentences if sentences else [text.strip()]
 
 
 # ============================================================
 # STRUCTURED GEMMA PROMPT
 # ============================================================
-
-# Wraps the user transcript so that one Gemma call returns both
-# the conversational reply and the Devanagari TTS text.
-# Keep responses concise (1 to 3 sentences) to minimize generation latency.
 
 def build_structured_prompt(transcript: str) -> str:
     return f"""You are Divya, the AI admissions counselor for Regular MBA at Jain College of Engineering and Research, Udyambag, Belagavi (VTU affiliated, AICTE approved).
@@ -158,7 +184,7 @@ def parse_gemma_json(raw: str, fallback_reply: str = "") -> tuple:
 
 
 # ============================================================
-# MAIN CHAT ENDPOINT
+# MAIN BATCH CHAT ENDPOINT (Existing Fallback Pipeline)
 # ============================================================
 
 @app.post("/chat")
@@ -173,13 +199,11 @@ async def chat(
     t_request_start = time.perf_counter()
 
     print("\n" + "=" * 60)
-    print("NEW CHAT REQUEST")
+    print("NEW CHAT REQUEST (BATCH)")
     print("Session:", session_id)
     print("=" * 60)
 
-    # --------------------------------------------------------
     # 1. AUDIO → ASR
-    # --------------------------------------------------------
     print("\n[1/3] Sending audio to ASR...")
     t_read_start = time.perf_counter()
     audio_data = await file.read()
@@ -219,7 +243,6 @@ async def chat(
     transcript = asr_result.get("text", "").strip()
     print(f"[TIMING] ASR: {t_asr_elapsed:.3f}s -> Transcript: '{transcript}'")
 
-    # Empty transcript handling
     if not transcript:
         return {
             "status": "success",
@@ -232,9 +255,7 @@ async def chat(
             "audio_b64": None
         }
 
-    # --------------------------------------------------------
-    # 2. TRANSCRIPT → GEMMA (Single-Pass Structured Output)
-    # --------------------------------------------------------
+    # 2. TRANSCRIPT → GEMMA
     print("\n[2/3] Sending transcript to Gemma...")
     structured_prompt = build_structured_prompt(transcript)
 
@@ -270,9 +291,7 @@ async def chat(
     print(f"  Reply:    '{reply}'")
     print(f"  TTS text: '{tts_text}'")
 
-    # --------------------------------------------------------
     # 3. DEVANAGARI → PARLER TTS
-    # --------------------------------------------------------
     print("\n[3/3] Sending text to Parler TTS...")
     t_tts_start = time.perf_counter()
     try:
@@ -308,7 +327,7 @@ async def chat(
     t_total = time.perf_counter() - t_request_start
 
     print("\n" + "=" * 60)
-    print("REQUEST COMPLETE")
+    print("REQUEST COMPLETE (BATCH)")
     print(f"Session:     {session_id}")
     print(f"Audio bytes: {len(audio_data)}")
     print(f"ASR:         {t_asr_elapsed:.3f} s")
@@ -335,6 +354,103 @@ async def chat(
             "total_s": round(t_total, 3)
         }
     }
+
+
+# ============================================================
+# STREAMING SSE CHAT ENDPOINT (Sentence-Pipelined SSE)
+# ============================================================
+
+@app.post("/chat/stream")
+async def chat_stream(
+    file: UploadFile = File(None),
+    transcript: str = Form(None),
+    session_id: str = Form(None),
+    language: str = Form("hi")
+):
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        t_start = time.perf_counter()
+        active_transcript = (transcript or "").strip()
+        t_asr = 0.0
+
+        # Step 1: ASR if audio file provided
+        if not active_transcript and file is not None:
+            t_asr_start = time.perf_counter()
+            audio_bytes = await file.read()
+            try:
+                asr_response = http_session.post(
+                    ASR_URL,
+                    files={"file": (file.filename or "audio.wav", audio_bytes, file.content_type or "audio/wav")},
+                    data={"language": language, "decoding": "ctc"},
+                    timeout=120
+                )
+                asr_response.raise_for_status()
+                active_transcript = asr_response.json().get("text", "").strip()
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'stage': 'asr', 'error': str(e)})}\n\n"
+                return
+
+            t_asr = time.perf_counter() - t_asr_start
+            yield f"data: {json.dumps({'type': 'asr_final', 'transcript': active_transcript, 'asr_time_s': round(t_asr, 3)})}\n\n"
+
+        if not active_transcript:
+            yield f"data: {json.dumps({'type': 'done', 'reply': '', 'tts_text': '', 'audio_chunks': 0})}\n\n"
+            return
+
+        # Step 2: Gemma
+        yield f"data: {json.dumps({'type': 'gemma_start'})}\n\n"
+        t_gemma_start = time.perf_counter()
+        structured_prompt = build_structured_prompt(active_transcript)
+
+        try:
+            gemma_response = http_session.post(
+                GEMMA_URL,
+                json={"session_id": session_id, "text": structured_prompt},
+                timeout=120
+            )
+            gemma_response.raise_for_status()
+            raw_gemma = gemma_response.json().get("reply", "").strip()
+            reply, tts_text = parse_gemma_json(raw_gemma, fallback_reply=active_transcript)
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'stage': 'gemma', 'error': str(e)})}\n\n"
+            return
+
+        t_gemma_elapsed = time.perf_counter() - t_gemma_start
+        yield f"data: {json.dumps({'type': 'gemma_final', 'reply': reply, 'tts_text': tts_text, 'gemma_time_s': round(t_gemma_elapsed, 3)})}\n\n"
+
+        # Step 3: Sentence-Pipelined TTS
+        sentences = split_into_sentences(tts_text)
+        first_audio_emitted = False
+        t_first_audio = 0.0
+
+        for idx, sentence in enumerate(sentences):
+            t_tts_start = time.perf_counter()
+            try:
+                tts_response = http_session.post(TTS_URL, json={"text": sentence}, timeout=120)
+                tts_response.raise_for_status()
+                tts_result = tts_response.json()
+                audio_b64 = tts_result.get("audio_b64")
+                sample_rate = tts_result.get("sample_rate", 22050)
+                t_tts_elapsed = time.perf_counter() - t_tts_start
+
+                if not first_audio_emitted:
+                    first_audio_emitted = True
+                    t_first_audio = time.perf_counter() - t_start
+
+                yield f"data: {json.dumps({'type': 'audio_chunk', 'chunk_index': idx, 'total_chunks': len(sentences), 'sentence': sentence, 'audio_b64': audio_b64, 'sample_rate': sample_rate, 'tts_time_s': round(t_tts_elapsed, 3), 'first_audio_latency_s': round(t_first_audio, 3)})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'tts_chunk_error', 'chunk_index': idx, 'error': str(e)})}\n\n"
+
+        t_total = time.perf_counter() - t_start
+        yield f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'transcript': active_transcript, 'reply': reply, 'tts_text': tts_text, 'timings': {'asr_s': round(t_asr, 3), 'gemma_s': round(t_gemma_elapsed, 3), 'first_audio_latency_s': round(t_first_audio, 3), 'total_s': round(t_total, 3)}})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
+    )
 
 
 # ============================================================
