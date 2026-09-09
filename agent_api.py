@@ -235,6 +235,41 @@ def extract_complete_sentences(buffer_text: str) -> tuple:
     return sentences, buffer_text[last_end:]
 
 
+# For the FIRST audio chunk only, flush at the earliest natural break — a comma
+# or clause boundary — instead of waiting for a full sentence. Gemma then only
+# has to generate a handful of words, and TTS only has to synthesize a short
+# clause, so the caller hears the first audio in ~1-2s instead of waiting for a
+# long opening sentence. Later chunks use full sentence boundaries for natural
+# prosody.
+_FIRST_CHUNK_BOUNDARY_RE = re.compile(r'[,;:।\.\?\!\n]')
+_FIRST_CHUNK_MIN_LEN = 6
+_FIRST_CHUNK_MAX_LEN = 45
+
+
+def extract_first_chunk(buffer_text: str, min_len: int = _FIRST_CHUNK_MIN_LEN,
+                        max_len: int = _FIRST_CHUNK_MAX_LEN) -> tuple:
+    """
+    Return (chunk, remaining) as soon as the first audio chunk can be flushed;
+    otherwise (None, buffer) to keep accumulating.
+
+    Flush when either:
+      - an early clause boundary (comma/danda/etc.) appears at/after min_len, or
+      - the buffer passes max_len with no boundary yet — then cut at the last
+        space so a long comma-less opening clause still yields fast first audio
+        without splitting a word.
+    """
+    for m in _FIRST_CHUNK_BOUNDARY_RE.finditer(buffer_text):
+        if m.end() >= min_len:
+            return buffer_text[:m.end()].strip(), buffer_text[m.end():]
+
+    if len(buffer_text) >= max_len:
+        cut = buffer_text.rfind(" ")
+        if cut >= min_len:
+            return buffer_text[:cut].strip(), buffer_text[cut:]
+
+    return None, buffer_text
+
+
 def stream_gemma_text(session_id: str, prompt: str, timings: dict):
     """
     Opens a streaming HTTP request to the Gemma service's /chat/stream route
@@ -565,20 +600,31 @@ async def chat_stream(
 
         def gemma_producer():
             buffer = ""
+            first_chunk_done = False
             try:
                 for text_piece in stream_gemma_text(session_id, streaming_prompt, timings):
                     producer_state["reply_parts"].append(text_piece)
                     buffer += text_piece
-                    sentences, buffer = extract_complete_sentences(buffer)
-                    for sentence in sentences:
-                        if "gemma_first_sentence_s" not in timings:
+
+                    # First audio chunk: flush at the earliest clause boundary so
+                    # the caller hears something in ~1-2s.
+                    if not first_chunk_done:
+                        chunk, buffer = extract_first_chunk(buffer)
+                        if chunk:
+                            first_chunk_done = True
                             timings["gemma_first_sentence_s"] = round(time.perf_counter() - t_request_start, 3)
                             print(f"[TIMING] GEMMA_FIRST_TOKEN: {timings.get('gemma_first_token_s', 0):.3f}s")
                             print(f"[TIMING] GEMMA_FIRST_TEXT_CHUNK: {timings.get('gemma_first_text_chunk_s', 0):.3f}s")
                             print(f"[TIMING] GEMMA_FIRST_SENTENCE: {timings['gemma_first_sentence_s']:.3f}s")
+                            sentence_queue.put(chunk)
+                        continue
+
+                    # Subsequent chunks: full sentence boundaries for natural prosody.
+                    sentences, buffer = extract_complete_sentences(buffer)
+                    for sentence in sentences:
                         sentence_queue.put(sentence)
 
-                # Flush any trailing text that never hit a sentence boundary.
+                # Flush any trailing text that never hit a boundary.
                 tail = buffer.strip()
                 if tail:
                     if "gemma_first_sentence_s" not in timings:
