@@ -3,10 +3,26 @@ import json
 import time
 import codecs
 import queue
+import random
 import threading
 import requests
 import uuid
 from typing import Generator
+
+# Pre-synthesized filler acknowledgments ("haan ji,", "hmm,", ...), baked in
+# by the one-time generate_fillers.py script. Masks the turn's real latency
+# (which can vary a lot -- see the streaming/contention work) with an
+# instant, natural-sounding acknowledgment while Gemma generates behind it.
+# Optional: if filler_audio.py hasn't been generated yet, filler emission is
+# simply skipped and behavior is identical to before this feature existed.
+try:
+    from filler_audio import FILLERS
+except ImportError:
+    FILLERS = []
+
+# Per-session last-used filler index, so we don't play the exact same clip
+# twice in a row for one caller.
+_last_filler_index = {}
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -603,6 +619,37 @@ async def chat_stream(
         sentence_queue: "queue.Queue" = queue.Queue()
         producer_state = {"reply_parts": [], "error": None}
 
+        # Filler acknowledgment: play it as chunk 0, before Gemma has produced
+        # anything. It's a cache lookup (no synthesis), so it costs ~0ms --
+        # the caller hears Divya start responding immediately regardless of
+        # how long the real reply takes underneath it. Emitted as a normal
+        # "audio_chunk" event (same schema as real chunks) so the browser
+        # needs no changes at all; the real reply's own chunks simply start
+        # numbering from 1 instead of 0.
+        chunk_index = 0
+        if FILLERS:
+            idx = random.randrange(len(FILLERS))
+            if len(FILLERS) > 1 and _last_filler_index.get(session_id) == idx:
+                idx = (idx + 1) % len(FILLERS)
+            _last_filler_index[session_id] = idx
+            filler = FILLERS[idx]
+            t_filler_ready = time.perf_counter() - t_request_start
+            timings["filler_ready_s"] = round(t_filler_ready, 3)
+            print(f"[TIMING] FILLER_READY: {t_filler_ready:.3f}s ('{filler['text']}')")
+            filler_payload = {
+                "type": "audio_chunk",
+                "chunk_index": chunk_index,
+                "total_chunks": None,
+                "sentence": filler["text"],
+                "audio_b64": filler["audio_b64"],
+                "sample_rate": filler.get("sample_rate", 22050),
+                "tts_time_s": 0.0,
+                "first_audio_latency_s": round(t_filler_ready, 3),
+                "is_filler": True,
+            }
+            yield f"data: {json.dumps(filler_payload, ensure_ascii=False)}\n\n"
+            chunk_index += 1
+
         def gemma_producer():
             buffer = ""
             first_chunk_done = False
@@ -645,8 +692,10 @@ async def chat_stream(
         producer.start()
 
         # Consumer: drain sentences in order, one TTS call at a time.
-        chunk_index = 0
+        # (chunk_index continues from where the filler emission above left
+        # off -- 0 if no filler was played, 1 if it was.)
         first_audio_ready = False
+        real_chunk_count = 0  # counts REAL reply chunks only, not the filler
         t_tts_first_chunk = 0.0
         t_first_audio_ready = 0.0
 
@@ -654,6 +703,7 @@ async def chat_stream(
             sentence = sentence_queue.get()
             if sentence is _QUEUE_DONE:
                 break
+            real_chunk_count += 1
 
             t_tts_chunk_start = time.perf_counter()
             try:
@@ -690,8 +740,10 @@ async def chat_stream(
 
         producer.join()
 
-        # If Gemma streaming failed and produced no audio, surface the error.
-        if producer_state["error"] and chunk_index == 0:
+        # If Gemma streaming failed and produced no REAL audio (the filler
+        # acknowledgment, if any, doesn't count -- it's not part of the
+        # actual reply), surface the error.
+        if producer_state["error"] and real_chunk_count == 0:
             yield f"data: {json.dumps({'type': 'error', 'stage': 'gemma', 'error': producer_state['error']})}\n\n"
             return
 
@@ -715,6 +767,7 @@ async def chat_stream(
             "total_chunks": chunk_index,
             "timings": {
                 "asr_s": round(t_asr, 3),
+                "filler_ready_s": timings.get("filler_ready_s"),
                 "gemma_first_token_s": timings.get("gemma_first_token_s"),
                 "gemma_first_text_chunk_s": timings.get("gemma_first_text_chunk_s"),
                 "gemma_first_sentence_s": timings.get("gemma_first_sentence_s"),
