@@ -217,12 +217,18 @@ print("=" * 60)
 
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 
+# Load the model FULLY onto the GPU with no accelerate offload/hooks.
+# The earlier device_map="auto" + offload_buffers=True kept some buffers in
+# host (CPU) memory and shuttled them CPU<->GPU on every forward pass. That
+# made generation depend on the host memory subsystem per token, so right
+# after a CPU-heavy ASR call Gemma's first token stalled for several seconds.
+# The model is ~15 GB and the MIG slice is 71 GB, so it fits comfortably fully
+# resident on the GPU -> generation becomes CPU-independent and immune to ASR.
 model = AutoModelForMultimodalLM.from_pretrained(
     MODEL_ID,
     dtype=torch.bfloat16,
-    device_map="auto",
-    offload_buffers=True,
 )
+model = model.to("cuda")
 
 model.eval()
 
