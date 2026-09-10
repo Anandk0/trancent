@@ -232,7 +232,15 @@ const SILENCE_MS       = 1200;   // ms of silence before sending
 const RMS_THRESHOLD    = 0.012;  // voice activity threshold
 const SAMPLE_RATE      = 16000;
 const CHUNK_MS         = 100;    // analyser poll interval + recorder timeslice
-const PARTIAL_MS       = 700;    // cadence of progressive ASR passes during speech
+// Cadence of periodic progressive ASR passes during speech. Each pass
+// re-transcribes the WHOLE cumulative buffer (not just the new audio), so a
+// short cadence means many overlapping, increasingly-expensive re-decodes
+// stacking up back-to-back for the length of the utterance -- sustained CPU
+// load that was making Gemma's first token SLOWER, not faster, in real
+// calls. Kept deliberately loose; the immediate end-of-speech pass below
+// (triggerFinalPartial) is what actually guarantees a fresh transcript is
+// ready by the time the caller stops talking.
+const PARTIAL_MS       = 1800;
 
 let mediaStream        = null;
 let audioContext       = null;
@@ -251,6 +259,7 @@ let sessionId          = null;
 let partialTimer       = null;
 let partialInFlight    = false;
 let lastPartialText    = "";
+let finalPartialFired  = false;  // guards the one-shot end-of-speech ASR pass
 
 // Sequential Audio Chunk Playback Queue
 let audioQueue         = [];
@@ -340,6 +349,7 @@ function startListening() {
   recordedChunks = [];
   speaking       = false;
   lastPartialText = "";
+  finalPartialFired = false;
   clearTimeout(silenceTimer);
   silenceTimer = null;
   clearTimeout(vadTimeoutId);
@@ -417,6 +427,20 @@ async function runPartial() {
   schedulePartial();
 }
 
+// The instant the caller's voice drops back below the RMS threshold, fire
+// one immediate ASR pass over the full utterance-so-far. This uses the
+// ~1.2s of guaranteed trailing silence (SILENCE_MS) before onSilence fires
+// as dead time, so even a one-word reply ("haan", "achha") that ends before
+// the periodic PARTIAL_MS cadence ever ticks still gets a cached, ready
+// transcript -- avoiding the full-ASR-in-critical-path fallback entirely.
+function triggerFinalPartial() {
+  if (finalPartialFired) return;
+  finalPartialFired = true;
+  clearTimeout(partialTimer);
+  partialTimer = null;
+  runPartial();
+}
+
 // -----------------------------------------------------------------------
 
 function pollVAD() {
@@ -437,7 +461,15 @@ function pollVAD() {
     } else {
       clearTimeout(silenceTimer);
     }
+    // Re-arm the final-pass trigger: if this is a mid-sentence pause
+    // followed by more speech, the NEXT drop to silence (the real end of
+    // the utterance) must still get its own immediate ASR pass.
+    finalPartialFired = false;
     silenceTimer = setTimeout(onSilence, SILENCE_MS);
+  } else if (speaking) {
+    // Caller's voice just dropped below threshold -- kick the final ASR
+    // pass now, using the trailing-silence window as dead time.
+    triggerFinalPartial();
   }
 
   if (callActive && !isProcessing && !divyaSpeaking) {
