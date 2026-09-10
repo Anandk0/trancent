@@ -16,9 +16,12 @@ from typing import Generator
 # Optional: if filler_audio.py hasn't been generated yet, filler emission is
 # simply skipped and behavior is identical to before this feature existed.
 try:
-    from filler_audio import FILLERS
+    import filler_audio
+    FILLERS = getattr(filler_audio, "FILLERS", [])
+    NOT_UNDERSTOOD = getattr(filler_audio, "NOT_UNDERSTOOD", [])
 except ImportError:
     FILLERS = []
+    NOT_UNDERSTOOD = []
 
 # Per-session last-used filler index, so we don't play the exact same clip
 # twice in a row for one caller.
@@ -592,6 +595,17 @@ async def chat_stream(
             yield f"data: {json.dumps({'type': 'asr_final', 'transcript': active_transcript, 'asr_time_s': round(t_asr, 3)})}\n\n"
 
         if not active_transcript:
+            # ASR came back empty -- almost always the voice detector
+            # firing on background noise/breath with no real speech behind
+            # it. Previously this returned total silence: no reply, no
+            # acknowledgment, nothing -- which can feel like the call
+            # dropped, especially since this path can itself take several
+            # seconds (a full ASR pass ran and found nothing). Play a short
+            # "didn't catch that" clip instead so the caller always hears
+            # SOMETHING happen every turn.
+            if NOT_UNDERSTOOD:
+                clip = random.choice(NOT_UNDERSTOOD)
+                yield f"data: {json.dumps({'type': 'audio_chunk', 'chunk_index': 0, 'total_chunks': 1, 'sentence': clip['text'], 'audio_b64': clip['audio_b64'], 'sample_rate': clip.get('sample_rate', 22050), 'tts_time_s': 0.0, 'first_audio_latency_s': round(time.perf_counter() - t_request_start, 3), 'is_filler': True}, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'type': 'done', 'reply': '', 'tts_text': '', 'audio_chunks': 0})}\n\n"
             return
 

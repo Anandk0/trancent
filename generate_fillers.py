@@ -36,6 +36,15 @@ FILLER_PHRASES = [
     "जी बिलकुल,",
 ]
 
+# Played instead of total silence when ASR comes back with an empty
+# transcript (background noise/breath falsely triggering the voice
+# detector) -- without this, the caller hears nothing at all and the call
+# can feel like it dropped.
+NOT_UNDERSTOOD_PHRASES = [
+    "माफ़ कीजिए, फिर से बोलिए।",
+    "सॉरी, आपकी आवाज़ नहीं आई, दोबारा बोलेंगे?",
+]
+
 OUTPUT_FILE = "filler_audio.py"
 
 
@@ -59,6 +68,12 @@ def main():
         print(f"  - '{phrase}'")
         fillers.append(synthesize(phrase))
 
+    print(f"Synthesizing {len(NOT_UNDERSTOOD_PHRASES)} 'didn't catch that' phrase(s) ...")
+    not_understood = []
+    for phrase in NOT_UNDERSTOOD_PHRASES:
+        print(f"  - '{phrase}'")
+        not_understood.append(synthesize(phrase))
+
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(
             '"""\n'
@@ -66,10 +81,12 @@ def main():
             "Do not edit by hand; re-run generate_fillers.py to regenerate.\n"
             '"""\n\n'
         )
-        f.write(f"FILLERS = {json.dumps(fillers, ensure_ascii=False, indent=4)}\n")
+        f.write(f"FILLERS = {json.dumps(fillers, ensure_ascii=False, indent=4)}\n\n")
+        f.write(f"NOT_UNDERSTOOD = {json.dumps(not_understood, ensure_ascii=False, indent=4)}\n")
 
-    total_bytes = sum(len(base64.b64decode(fl["audio_b64"])) for fl in fillers)
-    print(f"\nWrote {OUTPUT_FILE} ({len(fillers)} clip(s), {total_bytes/1024:.1f} KB decoded audio).")
+    all_clips = fillers + not_understood
+    total_bytes = sum(len(base64.b64decode(fl["audio_b64"])) for fl in all_clips)
+    print(f"\nWrote {OUTPUT_FILE} ({len(all_clips)} clip(s) total, {total_bytes/1024:.1f} KB decoded audio).")
     print("Restart agent_api.py to pick it up.")
 
 
