@@ -258,6 +258,10 @@ let sessionId          = null;
 // Progressive streaming-ASR state
 let partialTimer       = null;
 let partialInFlight    = false;
+let pendingFinalRequest = false;  // a final-pass request arrived while a
+                                   // call was already in flight -- must NOT
+                                   // be dropped; run one more pass over the
+                                   // freshest audio the moment it finishes
 let lastPartialText    = "";
 let finalPartialFired  = false;  // guards the one-shot end-of-speech ASR pass
 
@@ -384,20 +388,36 @@ function stopListening() {
 function schedulePartial() {
   clearTimeout(partialTimer);
   if (!callActive || isProcessing || divyaSpeaking) return;
-  partialTimer = setTimeout(runPartial, PARTIAL_MS);
+  partialTimer = setTimeout(() => requestPartial(false), PARTIAL_MS);
 }
 
 function stopPartialLoop() {
   clearTimeout(partialTimer);
   partialTimer = null;
+  pendingFinalRequest = false;
 }
 
-async function runPartial() {
+// Single entry point for both the periodic ASR pass and the end-of-speech
+// "final" pass. isFinal=true means: this MUST result in a pass over the
+// freshest audio buffer, even if a call is already in flight -- never
+// silently dropped in favor of the slow periodic cadence. Dropping it was
+// the bug: if a periodic pass happened to be in flight exactly when speech
+// ended, the final pass used to just re-arm the 1800ms periodic timer
+// instead, so the cached transcript could be stuck at an earlier, cut-off
+// point in the sentence ("मैंने अभी दस" instead of the full sentence).
+async function requestPartial(isFinal) {
   partialTimer = null;
-  // Only transcribe while the caller is actively speaking this turn.
   if (!callActive || isProcessing || divyaSpeaking) return;
-  if (!speaking || recordedChunks.length === 0 || partialInFlight) {
-    schedulePartial();
+  if (!speaking || recordedChunks.length === 0) {
+    if (!isFinal) schedulePartial();
+    return;
+  }
+  if (partialInFlight) {
+    if (isFinal) {
+      pendingFinalRequest = true;
+    } else {
+      schedulePartial();
+    }
     return;
   }
 
@@ -424,7 +444,16 @@ async function runPartial() {
     console.warn("partial ASR error", e);
   }
   partialInFlight = false;
-  schedulePartial();
+
+  if (pendingFinalRequest) {
+    // A final request came in while we were busy -- run it now, over
+    // whatever audio has accumulated since, instead of waiting for the
+    // periodic timer (which could be up to PARTIAL_MS late).
+    pendingFinalRequest = false;
+    requestPartial(true);
+  } else {
+    schedulePartial();
+  }
 }
 
 // The instant the caller's voice drops back below the RMS threshold, fire
@@ -437,8 +466,7 @@ function triggerFinalPartial() {
   if (finalPartialFired) return;
   finalPartialFired = true;
   clearTimeout(partialTimer);
-  partialTimer = null;
-  runPartial();
+  requestPartial(true);
 }
 
 // -----------------------------------------------------------------------
