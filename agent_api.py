@@ -592,7 +592,12 @@ async def chat_stream(
         # Because the producer keeps reading Gemma while the consumer is busy
         # synthesizing, TTS(sentence 1) overlaps Gemma generating sentence 2.
         yield f"data: {json.dumps({'type': 'gemma_start'})}\n\n"
-        streaming_prompt = build_streaming_prompt(active_transcript)
+        # Send ONLY the raw transcript. The counselor persona and the
+        # "reply concisely in Devanagari Hinglish" style now live once in the
+        # Gemma server's system prompt, so we no longer resend a ~400-token
+        # instruction block every turn (which used to pile up in the session
+        # history and slow generation to a crawl over a long call).
+        gemma_input = active_transcript
 
         timings = {"t_request_start": t_request_start}
         sentence_queue: "queue.Queue" = queue.Queue()
@@ -602,7 +607,7 @@ async def chat_stream(
             buffer = ""
             first_chunk_done = False
             try:
-                for text_piece in stream_gemma_text(session_id, streaming_prompt, timings):
+                for text_piece in stream_gemma_text(session_id, gemma_input, timings):
                     producer_state["reply_parts"].append(text_piece)
                     buffer += text_piece
 

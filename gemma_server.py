@@ -193,6 +193,17 @@ SPECIALIZATION KNOWLEDGE BOUNDARY:
 - Do not claim that one specialization has better placements, higher salary,
   more demand, or better career prospects unless that information is explicitly
   provided by the application or an external tool.
+
+RESPONSE FORMAT (VERY IMPORTANT — this is a live phone call):
+- Keep every reply SHORT: 1 to 2 sentences. Never more. Brevity matters more
+  than completeness on a call; the student can always ask for more.
+- Write the ENTIRE reply in Devanagari (Hindi) script, including Hinglish.
+  Write English professional terms phonetically in Devanagari, e.g.
+  MBA → एमबीए, HR → एचआर, Finance → फाइनेंस, Marketing → मार्केटिंग,
+  Placement → प्लेसमेंट, Admission → एडमिशन, Specialization → स्पेशलाइज़ेशन,
+  Business Analytics → बिज़नेस एनालिटिक्स, VTU → वीटीयू, AICTE → एआईसीटीई.
+- Do NOT reply in Roman/Latin letters. Do NOT use JSON, markdown, labels, or
+  quotation marks around the reply. Output only the spoken sentence(s).
 """
 
 
@@ -261,6 +272,12 @@ app = FastAPI(title="Gemma Conversation Server")
 
 sessions: Dict[str, List[dict]] = {}
 
+# Cap how many past messages are replayed into the model per turn. The system
+# prompt is always included separately; this only bounds the rolling
+# conversation history so a long call cannot keep growing the context (and thus
+# the per-turn latency) without limit. 12 messages = ~6 back-and-forth turns.
+MAX_HISTORY_MESSAGES = 12
+
 
 # ============================================================
 # REQUEST / RESPONSE
@@ -296,7 +313,9 @@ def build_inputs(conversation_history):
         }
     ]
 
-    messages.extend(conversation_history)
+    # Only replay the most recent turns so context (and latency) stays bounded
+    # on long calls. The system prompt above is always kept in full.
+    messages.extend(conversation_history[-MAX_HISTORY_MESSAGES:])
 
     inputs = processor.apply_chat_template(
         messages,
