@@ -228,8 +228,17 @@ HTML_PAGE = """<!DOCTYPE html>
 <div id="log"></div>
 
 <script>
-const SILENCE_MS       = 1200;   // ms of silence before sending
-const RMS_THRESHOLD    = 0.012;  // voice activity threshold
+// Raised from 1200ms: a quieter word or a natural mid-sentence pause could
+// dip below RMS_THRESHOLD for over a second, finalizing the turn after
+// only the first couple words. More buffer here trades a bit of latency
+// on every turn for not cutting sentences off.
+const SILENCE_MS       = 1600;
+// Lowered from 0.012: that threshold was too strict for normal speaking
+// volume once the initial loud word(s) passed -- a natural volume dip
+// mid-sentence was being misread as "stopped talking," discarding
+// everything said after it. Lower catches continued quieter speech as
+// still-active voice instead of false silence.
+const RMS_THRESHOLD    = 0.006;
 const SAMPLE_RATE      = 16000;
 const CHUNK_MS         = 100;    // analyser poll interval + recorder timeslice
 // Cadence of periodic progressive ASR passes during speech. Each pass
