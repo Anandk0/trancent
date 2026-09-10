@@ -2,15 +2,18 @@ import time
 import json
 import base64
 import uuid
+import threading
 
 import requests
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 
 AGENT_STREAM_URL = "http://127.0.0.1:8002/chat/stream"
 AGENT_BATCH_URL = "http://127.0.0.1:8002/chat"
+ASR_URL = "http://127.0.0.1:8001/transcribe"
 HOST = "0.0.0.0"
 PORT = 8080
 
@@ -24,12 +27,30 @@ http_session.mount("https://", adapter)
 
 
 # ============================================================
+# STREAMING ASR STATE
+# ------------------------------------------------------------
+# The browser POSTs the growing (cumulative) audio buffer to /asr_partial
+# every ~700ms WHILE the caller is still speaking. Each partial is
+# transcribed and the latest transcript is stored per session here.
+#
+# When the caller stops (VAD silence), /process pops the already-computed
+# transcript and forwards it to the agent as `transcript=`, so the agent
+# does NO ASR right before Gemma. The heavy ASR compute has already happened,
+# overlapped with the caller's speech (dead time) instead of sitting in the
+# critical path where it stalls Gemma's first token.
+# ============================================================
+
+LATEST_TRANSCRIPT = {}          # session_id -> {"text": str, "ts": float}
+_transcript_lock = threading.Lock()
+
+
+# ============================================================
 # HEALTH
 # ============================================================
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "call-server", "mode": "http-streaming"}
+    return {"status": "ok", "service": "call-server", "mode": "http-streaming-asr"}
 
 
 # ============================================================
@@ -42,9 +63,52 @@ def index():
 
 
 # ============================================================
-# PROCESS ENDPOINT (HTTP SSE Streaming)
-# Browser POSTs raw audio bytes here.
-# Streams Server-Sent Events with ASR, text, and TTS audio chunks.
+# PARTIAL ASR ENDPOINT (called repeatedly DURING speech)
+# Browser POSTs the cumulative audio buffer (valid WebM from the start).
+# We transcribe it and cache the latest transcript for this session.
+# ============================================================
+
+@app.post("/asr_partial")
+async def asr_partial(request: Request):
+    audio_bytes = await request.body()
+    session_id = request.headers.get("X-Session-Id", "")
+
+    if not audio_bytes or not session_id:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "missing audio or session id"}
+        )
+
+    def _run_asr():
+        r = http_session.post(
+            ASR_URL,
+            files={"file": ("partial.webm", audio_bytes, "audio/webm")},
+            data={"language": "hi", "decoding": "ctc"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json().get("text", "").strip()
+
+    try:
+        # Offload the blocking ASR call so the event loop stays free for the
+        # SSE forwarding on /process.
+        text = await run_in_threadpool(_run_asr)
+    except Exception as e:
+        print("ASR PARTIAL ERROR:", e)
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)})
+
+    if text:
+        with _transcript_lock:
+            LATEST_TRANSCRIPT[session_id] = {"text": text, "ts": time.time()}
+
+    return {"status": "ok", "transcript": text}
+
+
+# ============================================================
+# PROCESS ENDPOINT (called ONCE at end-of-speech)
+# If a streamed partial transcript exists for this session, forward it to
+# the agent as `transcript=` (skips ASR entirely -> no burst before Gemma).
+# Otherwise fall back to forwarding the raw audio (agent does ASR).
 # ============================================================
 
 @app.post("/process")
@@ -54,30 +118,51 @@ async def process(request: Request):
     print("\n" + "=" * 60)
     print("CALL SERVER: NEW STREAMING REQUEST")
 
-    # 1. Read raw audio bytes from browser
-    t_read_start = time.perf_counter()
     audio_bytes = await request.body()
-    t_read_elapsed = time.perf_counter() - t_read_start
-    print(f"[TIMING] BROWSER_AUDIO_READ: {t_read_elapsed:.3f}s ({len(audio_bytes)} bytes)")
+    session_id = request.headers.get("X-Session-Id", str(uuid.uuid4()))
+    print("Session:", session_id, "| audio bytes:", len(audio_bytes))
 
-    if not audio_bytes:
+    # Prefer the transcript already computed during speech.
+    with _transcript_lock:
+        cached = LATEST_TRANSCRIPT.pop(session_id, None)
+    streamed_transcript = cached["text"] if cached else None
+
+    if streamed_transcript:
+        print(f"[STREAM-ASR] using pre-computed transcript: '{streamed_transcript}'")
+    elif not audio_bytes:
         return JSONResponse(
             status_code=400,
-            content={"status": "error", "error": "No audio received"}
+            content={"status": "error", "error": "No audio and no streamed transcript"}
         )
+    else:
+        print("[STREAM-ASR] no partial available; agent will run ASR on audio (fallback)")
 
-    session_id = request.headers.get("X-Session-Id", str(uuid.uuid4()))
-    print("Session:", session_id)
-
-    # 2. Forward stream to agent_api /chat/stream
     def stream_forwarder():
         try:
+            if streamed_transcript:
+                # Emit the asr_final event ourselves (the agent won't, since it
+                # is skipping ASR), so the browser shows what the caller said.
+                asr_evt = {
+                    "type": "asr_final",
+                    "transcript": streamed_transcript,
+                    "asr_time_s": 0.0,
+                    "streamed": True,
+                }
+                yield f"data: {json.dumps(asr_evt, ensure_ascii=False)}\n\n"
+                post_kwargs = dict(
+                    data={"session_id": session_id, "transcript": streamed_transcript}
+                )
+            else:
+                post_kwargs = dict(
+                    files={"file": ("audio.wav", audio_bytes, "audio/wav")},
+                    data={"session_id": session_id, "language": "hi"},
+                )
+
             with http_session.post(
                 AGENT_STREAM_URL,
-                files={"file": ("audio.wav", audio_bytes, "audio/wav")},
-                data={"session_id": session_id, "language": "hi"},
                 stream=True,
-                timeout=180
+                timeout=180,
+                **post_kwargs,
             ) as agent_resp:
                 agent_resp.raise_for_status()
                 for line in agent_resp.iter_lines(decode_unicode=True):
@@ -105,6 +190,8 @@ async def process(request: Request):
 # - browser microphone via MediaRecorder
 # - RMS-based voice activity detection
 # - silence detection (~1.2 s)
+# - PROGRESSIVE STREAMING ASR: cumulative audio POSTed every ~700ms while
+#   the caller speaks, so the transcript is ready the instant they stop
 # - in-flight concurrency lock (single request at a time)
 # - HTTP streaming SSE consumption
 # - gapless sequential Web Audio chunk queue player
@@ -132,7 +219,7 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <h1>📞 Jain College MBA Admissions</h1>
-<p>AI Admission Counselor – Divya (Low-Latency Streaming Voice)</p>
+<p>AI Admission Counselor – Divya (Streaming ASR)</p>
 
 <button id="startBtn" onclick="startCall()">📞 Start Call</button>
 <button id="endBtn"   onclick="endCall()">🔴 End Call</button>
@@ -144,7 +231,8 @@ HTML_PAGE = """<!DOCTYPE html>
 const SILENCE_MS       = 1200;   // ms of silence before sending
 const RMS_THRESHOLD    = 0.012;  // voice activity threshold
 const SAMPLE_RATE      = 16000;
-const CHUNK_MS         = 100;    // analyser poll interval
+const CHUNK_MS         = 100;    // analyser poll interval + recorder timeslice
+const PARTIAL_MS       = 700;    // cadence of progressive ASR passes during speech
 
 let mediaStream        = null;
 let audioContext       = null;
@@ -158,6 +246,11 @@ let callActive         = false;
 let divyaSpeaking      = false;
 let isProcessing       = false;  // client-side in-flight / processing lock
 let sessionId          = null;
+
+// Progressive streaming-ASR state
+let partialTimer       = null;
+let partialInFlight    = false;
+let lastPartialText    = "";
 
 // Sequential Audio Chunk Playback Queue
 let audioQueue         = [];
@@ -176,6 +269,8 @@ function setStatus(text, cls) {
   el.textContent = text;
   el.className = cls;
 }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function generateSessionId() {
   return "browser-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
@@ -224,6 +319,7 @@ function endCall() {
   isProcessing = false;
   divyaSpeaking = false;
   stopListening();
+  stopPartialLoop();
   if (currentSource) {
     try { currentSource.stop(); } catch (e) {}
   }
@@ -243,6 +339,7 @@ function startListening() {
 
   recordedChunks = [];
   speaking       = false;
+  lastPartialText = "";
   clearTimeout(silenceTimer);
   silenceTimer = null;
   clearTimeout(vadTimeoutId);
@@ -259,6 +356,7 @@ function startListening() {
   }
 
   pollVAD();
+  schedulePartial();
 }
 
 function stopListening() {
@@ -270,6 +368,56 @@ function stopListening() {
     mediaRecorder.stop();
   }
 }
+
+// ---- Progressive streaming ASR ----------------------------------------
+
+function schedulePartial() {
+  clearTimeout(partialTimer);
+  if (!callActive || isProcessing || divyaSpeaking) return;
+  partialTimer = setTimeout(runPartial, PARTIAL_MS);
+}
+
+function stopPartialLoop() {
+  clearTimeout(partialTimer);
+  partialTimer = null;
+}
+
+async function runPartial() {
+  partialTimer = null;
+  // Only transcribe while the caller is actively speaking this turn.
+  if (!callActive || isProcessing || divyaSpeaking) return;
+  if (!speaking || recordedChunks.length === 0 || partialInFlight) {
+    schedulePartial();
+    return;
+  }
+
+  partialInFlight = true;
+  try {
+    // Cumulative blob: valid WebM from the first chunk, so ffmpeg on the ASR
+    // server can decode it standalone every time.
+    const blob = new Blob(recordedChunks, { type: "audio/webm" });
+    const buf = await blob.arrayBuffer();
+    const resp = await fetch("asr_partial", {
+      method: "POST",
+      headers: { "Content-Type": "audio/webm", "X-Session-Id": sessionId },
+      body: buf
+    });
+    if (resp.ok) {
+      const j = await resp.json();
+      if (j.transcript) {
+        lastPartialText = j.transcript;
+        setStatus("🎙️ Listening... (" + lastPartialText + ")", "listening");
+      }
+    }
+  } catch (e) {
+    // Partial failures are non-fatal; the /process fallback still works.
+    console.warn("partial ASR error", e);
+  }
+  partialInFlight = false;
+  schedulePartial();
+}
+
+// -----------------------------------------------------------------------
 
 function pollVAD() {
   if (!callActive || isProcessing || divyaSpeaking) return;
@@ -306,8 +454,8 @@ function onSilence() {
   audioQueue = [];
   isPlayingQueue = false;
 
-  log("Silence detected – sending audio...");
-  log("Processing utterance...");
+  stopPartialLoop();
+  log("Silence detected – finalizing...");
   stopListening();
 }
 
@@ -319,13 +467,23 @@ function onRecordingStop() {
   }
 
   const blob = new Blob(recordedChunks, { type: "audio/webm" });
-  log("Audio blob: " + blob.size + " bytes");
+  log("Audio blob: " + blob.size + " bytes"
+      + (lastPartialText ? " | partial ASR ready" : " | no partial (fallback)"));
   sendAudioStream(blob);
 }
 
 async function sendAudioStream(blob) {
   isProcessing = true;
   setStatus("⏳ Processing...", "processing");
+
+  // Let any in-flight partial finish so its transcript is cached server-side
+  // before /process pops it. (Partial ASR runs during dead time, not before
+  // Gemma, so this wait does not add to the critical path.)
+  let waited = 0;
+  while (partialInFlight && waited < 3000) {
+    await sleep(50);
+    waited += 50;
+  }
 
   const t0 = performance.now();
 
@@ -384,7 +542,7 @@ async function sendAudioStream(blob) {
 
 function handleStreamEvent(event) {
   if (event.type === "asr_final") {
-    log("You: " + event.transcript);
+    log("You: " + event.transcript + (event.streamed ? "  [streamed ASR]" : ""));
     log("[TIMING] ASR: " + event.asr_time_s + "s");
   }
   else if (event.type === "gemma_final") {
