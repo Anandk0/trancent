@@ -43,12 +43,17 @@ echo "=============================================================="
 for p in gemma_server.py asr_api.py agent_api.py svara_tts_api.py \
          kokoro_server.py call_server.py "api/server.py"; do
     n=$(pgrep -f "$p" | wc -l)
+    # vLLM (Svara's api/server.py) forks an engine worker, so two processes
+    # there is the healthy state, not a failed restart.
+    expected=1
+    [ "$p" = "api/server.py" ] && expected=2
     if [ "$n" -eq 0 ]; then
         printf "  %-20s not running\n" "$p"
-    elif [ "$n" -eq 1 ]; then
+    elif [ "$n" -le "$expected" ]; then
         printf "  %-20s running (pid %s)\n" "$p" "$(pgrep -f "$p" | tr '\n' ' ')"
     else
-        printf "  %-20s *** %s COPIES *** pids: %s\n" "$p" "$n" "$(pgrep -f "$p" | tr '\n' ' ')"
+        printf "  %-20s *** %s COPIES (expected %s) *** pids: %s\n" \
+            "$p" "$n" "$expected" "$(pgrep -f "$p" | tr '\n' ' ')"
     fi
 done
 
