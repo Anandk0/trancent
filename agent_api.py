@@ -723,10 +723,25 @@ async def chat_stream(
             try:
                 tts_response = http_session.post(TTS_URL, json={"text": sentence}, timeout=120)
                 tts_response.raise_for_status()
+                # Split the TTS call into "bytes arrived" vs "JSON parsed" so
+                # the transport/serialisation share is visible rather than
+                # inferred. Audio travels as base64 inside JSON, so a few
+                # hundred KB per clause crosses this boundary each time; this
+                # says outright whether that handling is material next to the
+                # synthesis itself.
+                t_tts_bytes = time.perf_counter()
+                payload_bytes = len(tts_response.content)
                 tts_result = tts_response.json()
+                t_tts_parsed = time.perf_counter()
                 audio_b64 = tts_result.get("audio_b64")
                 sample_rate = tts_result.get("sample_rate", 22050)
                 t_tts_chunk_elapsed = time.perf_counter() - t_tts_chunk_start
+                print(
+                    f"[TIMING] TTS_CHUNK {chunk_index}: {t_tts_chunk_elapsed:.3f}s "
+                    f"(http+synth {t_tts_bytes - t_tts_chunk_start:.3f}s, "
+                    f"json_parse {t_tts_parsed - t_tts_bytes:.3f}s, "
+                    f"{payload_bytes / 1024:.0f} KB)"
+                )
 
                 if not first_audio_ready:
                     first_audio_ready = True
