@@ -484,6 +484,13 @@ def stream_reply(conversation_history):
 
     t_start = time.perf_counter()
     inputs = build_inputs(conversation_history)
+    # Splitting this out matters: switching to a fused attention kernel moved
+    # TTFT only 1.92s -> 1.70s, which is not what you would see if the time
+    # were really GPU prefill. The other suspect is this call --
+    # apply_chat_template tokenises the entire prompt in Python on every
+    # request, before the GPU is touched at all. Measured separately, the two
+    # numbers say plainly which half to fix.
+    t_built = time.perf_counter()
 
     # Prompt length drives prefill, which IS the time-to-first-token. Logging
     # it alongside TTFT turns "Gemma feels slow" into a number we can act on:
@@ -539,11 +546,20 @@ def stream_reply(conversation_history):
         decode_s = t_end - t_first
         prefill_rate = prompt_tokens / ttft if ttft > 0 and prompt_tokens > 0 else 0
         decode_rate = pieces / decode_s if decode_s > 0 else 0
+        build_s = t_built - t_start
+        gpu_prefill_s = t_first - t_built
         print(
             f"[GEMMA] prompt={prompt_tokens} tok | TTFT={ttft:.3f}s "
-            f"(prefill ~{prefill_rate:.0f} tok/s) | decode={decode_s:.3f}s "
-            f"for {pieces} pieces (~{decode_rate:.1f}/s) | total={t_end - t_start:.3f}s"
+            f"(= build_inputs {build_s:.3f}s + gpu_prefill {gpu_prefill_s:.3f}s, "
+            f"prefill ~{prompt_tokens / gpu_prefill_s if gpu_prefill_s > 0 else 0:.0f} tok/s) "
+            f"| decode={decode_s:.3f}s for {pieces} pieces (~{decode_rate:.1f}/s) "
+            f"| total={t_end - t_start:.3f}s"
         )
+        if build_s > 0.25:
+            print(
+                f"[GEMMA] NOTE: {build_s:.2f}s of that was CPU-side prompt "
+                f"tokenisation, not the GPU. Cache the tokenised system prefix."
+            )
 
 
 # ============================================================
