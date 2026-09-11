@@ -239,6 +239,13 @@ const SILENCE_MS       = 1600;
 // everything said after it. Lower catches continued quieter speech as
 // still-active voice instead of false silence.
 const RMS_THRESHOLD    = 0.006;
+// Minimum cumulative above-threshold audio before a turn is allowed to
+// finalize. Guards the lowered RMS_THRESHOLD above: without it, brief
+// background noise (or Divya's own voice via speakers) trips the detector,
+// produces a recording with no actual words, and the empty-transcript
+// "didn't catch that" reply fires repeatedly. A short real word still
+// clears this comfortably; a noise blip does not.
+const MIN_VOICED_MS    = 350;
 const SAMPLE_RATE      = 16000;
 const CHUNK_MS         = 100;    // analyser poll interval + recorder timeslice
 // Cadence of periodic progressive ASR passes during speech. Each pass
@@ -259,6 +266,9 @@ let recordedChunks     = [];
 let silenceTimer       = null;
 let vadTimeoutId       = null;
 let speaking           = false;
+let voicedMs           = 0;      // cumulative ms of above-threshold audio
+                                 // this turn -- a noise blip accumulates
+                                 // very little, real speech accumulates a lot
 let callActive         = false;
 let divyaSpeaking      = false;
 let isProcessing       = false;  // client-side in-flight / processing lock
@@ -361,6 +371,7 @@ function startListening() {
 
   recordedChunks = [];
   speaking       = false;
+  voicedMs       = 0;
   lastPartialText = "";
   finalPartialFired = false;
   clearTimeout(silenceTimer);
@@ -498,6 +509,7 @@ function pollVAD() {
     } else {
       clearTimeout(silenceTimer);
     }
+    voicedMs += CHUNK_MS;
     // Re-arm the final-pass trigger: if this is a mid-sentence pause
     // followed by more speech, the NEXT drop to silence (the real end of
     // the utterance) must still get its own immediate ASR pass.
@@ -516,6 +528,23 @@ function pollVAD() {
 
 function onSilence() {
   if (!speaking || !callActive || isProcessing || divyaSpeaking) return;
+
+  // Noise gate: a cough, a door, a fan tick, or Divya's own voice leaking
+  // back through the speakers trips the RMS threshold for only a moment.
+  // Real speech -- even a one-word "haan" -- accumulates far more voiced
+  // time than that. Without this, every stray noise became a turn, ASR
+  // found no words in it, and the "didn't catch that" clip fired on a
+  // loop. Discard these silently and just keep listening.
+  if (voicedMs < MIN_VOICED_MS) {
+    log("Ignoring noise (only " + voicedMs + "ms of voice, need "
+        + MIN_VOICED_MS + "ms)");
+    speaking = false;
+    voicedMs = 0;
+    clearTimeout(silenceTimer);
+    silenceTimer = null;
+    finalPartialFired = false;
+    return;   // pollVAD keeps running; no turn, no server call, no audio
+  }
 
   // Engage processing lock immediately to block any duplicate requests
   isProcessing = true;
