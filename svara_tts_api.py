@@ -15,6 +15,7 @@ The actual Svara model server must be running separately (default: port 8095).
 """
 
 import base64
+import os
 
 import requests
 import uvicorn
@@ -30,8 +31,12 @@ from pydantic import BaseModel
 # Svara model server (OpenAI-compatible speech endpoint)
 SVARA_URL = "http://127.0.0.1:8095/v1/audio/speech"
 
-HOST = "0.0.0.0"
-PORT = 8003  # same port Parler used, so agent_api.py needs no change
+HOST = os.environ.get("SVARA_ADAPTER_HOST", "0.0.0.0")
+# Moved off 8003: kokoro_server.py now owns that port (it is ~50x faster for
+# Hindi, and being non-autoregressive it stops competing with Gemma for the
+# GPU). This adapter stays running as the Kannada route and the fallback for
+# any Kokoro failure, so behaviour can never regress below today's.
+PORT = int(os.environ.get("SVARA_ADAPTER_PORT", "8007"))
 
 # The counselor's spoken reply is Devanagari (Hindi/Hinglish), so hi_female is
 # the default. Language routing is available if agent_api ever passes a
