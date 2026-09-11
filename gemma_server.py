@@ -1,4 +1,5 @@
 import threading
+import time
 from threading import Thread
 
 import torch
@@ -287,10 +288,36 @@ processor = AutoProcessor.from_pretrained(MODEL_ID)
 # after a CPU-heavy ASR call Gemma's first token stalled for several seconds.
 # The model is ~15 GB and the MIG slice is 71 GB, so it fits comfortably fully
 # resident on the GPU -> generation becomes CPU-independent and immune to ASR.
-model = AutoModelForMultimodalLM.from_pretrained(
-    MODEL_ID,
-    dtype=torch.bfloat16,
-)
+#
+# Attention backend matters more than anything else here. Measured
+# time-to-first-token was 1.92s on a completely idle GPU for a ~2.2k-token
+# prompt -- about 1,170 tokens/sec of prefill, which is roughly an order of
+# magnitude below what this hardware should do and is the signature of the
+# eager attention path. TTFT is pure prefill, and prefill is the single
+# largest block in the whole voice pipeline, so switching to a fused
+# attention kernel attacks the dominant cost directly.
+#
+# Tried best-first, because availability depends on the installed
+# flash-attn / torch / CUDA combination and we would rather degrade than
+# fail to boot.
+def _load_model():
+    attempts = ["flash_attention_2", "sdpa", None]
+    last_error = None
+    for attn in attempts:
+        kwargs = {"dtype": torch.bfloat16}
+        if attn:
+            kwargs["attn_implementation"] = attn
+        try:
+            m = AutoModelForMultimodalLM.from_pretrained(MODEL_ID, **kwargs)
+            print(f"[GEMMA] attn_implementation = {attn or 'library default'}")
+            return m
+        except Exception as e:  # noqa: BLE001 - want to try the next backend
+            last_error = e
+            print(f"[GEMMA] {attn or 'default'} unavailable: {type(e).__name__}: {e}")
+    raise RuntimeError(f"could not load Gemma with any attention backend: {last_error}")
+
+
+model = _load_model()
 model = model.to("cuda")
 
 model.eval()
@@ -345,7 +372,18 @@ sessions: Dict[str, List[dict]] = {}
 # prompt is always included separately; this only bounds the rolling
 # conversation history so a long call cannot keep growing the context (and thus
 # the per-turn latency) without limit. 12 messages = ~6 back-and-forth turns.
-MAX_HISTORY_MESSAGES = 12
+# Every replayed message is re-prefilled on every turn, and prefill is the
+# dominant latency cost (TTFT measured 1.92s on an idle GPU). At 12 messages
+# a long call was adding roughly a thousand tokens of prefill on top of the
+# system prompt, so latency crept up the longer the caller talked. Six turns
+# is still plenty of context for a focused admissions call and keeps the
+# prompt -- and therefore the per-turn latency -- flat instead of growing.
+MAX_HISTORY_MESSAGES = 6
+
+# Upper bound on generated length. The system prompt asks for 1-2 sentences
+# and observed replies run ~40-60 tokens, so the previous 120 was headroom we
+# only paid for when the model ran long. Lower bounds the worst-case turn.
+MAX_NEW_TOKENS = 72
 
 
 # ============================================================
@@ -417,7 +455,7 @@ def generate_reply(conversation_history):
 
             output = model.generate(
                 **inputs,
-                max_new_tokens=120,
+                max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False,
             )
 
@@ -442,9 +480,19 @@ def stream_reply(conversation_history):
     TextIteratorStreamer; this generator yields each decoded text piece as
     soon as it is available, so the caller can start TTS on the first
     sentence long before generation finishes. Generation kwargs are identical
-    to the batch path (greedy, max_new_tokens=120)."""
+    to the batch path (greedy, max_new_tokens=MAX_NEW_TOKENS)."""
 
+    t_start = time.perf_counter()
     inputs = build_inputs(conversation_history)
+
+    # Prompt length drives prefill, which IS the time-to-first-token. Logging
+    # it alongside TTFT turns "Gemma feels slow" into a number we can act on:
+    # prefill tok/s tells us whether the attention backend is doing its job,
+    # and decode tok/s tells us whether generation throughput is the problem.
+    try:
+        prompt_tokens = int(inputs["input_ids"].shape[-1])
+    except Exception:  # noqa: BLE001 - instrumentation must never break a turn
+        prompt_tokens = -1
 
     streamer = TextIteratorStreamer(
         STREAM_TOKENIZER,
@@ -454,7 +502,10 @@ def stream_reply(conversation_history):
 
     generation_kwargs = dict(
         **inputs,
-        max_new_tokens=120,
+        # The system prompt asks for 1-2 sentences and observed replies run
+        # ~40-60 tokens, so 120 was headroom we only ever paid for on a
+        # runaway. Capping lower bounds the worst-case turn.
+        max_new_tokens=MAX_NEW_TOKENS,
         do_sample=False,
         streamer=streamer,
     )
@@ -469,11 +520,30 @@ def stream_reply(conversation_history):
     thread = Thread(target=_run_generation, name="gemma-generate", daemon=True)
     thread.start()
 
+    t_first = None
+    pieces = 0
+    chars = 0
     for new_text in streamer:
         if new_text:
+            if t_first is None:
+                t_first = time.perf_counter()
+            pieces += 1
+            chars += len(new_text)
             yield new_text
 
     thread.join()
+
+    t_end = time.perf_counter()
+    if t_first is not None:
+        ttft = t_first - t_start
+        decode_s = t_end - t_first
+        prefill_rate = prompt_tokens / ttft if ttft > 0 and prompt_tokens > 0 else 0
+        decode_rate = pieces / decode_s if decode_s > 0 else 0
+        print(
+            f"[GEMMA] prompt={prompt_tokens} tok | TTFT={ttft:.3f}s "
+            f"(prefill ~{prefill_rate:.0f} tok/s) | decode={decode_s:.3f}s "
+            f"for {pieces} pieces (~{decode_rate:.1f}/s) | total={t_end - t_start:.3f}s"
+        )
 
 
 # ============================================================
