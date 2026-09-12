@@ -59,6 +59,35 @@ done
 
 echo
 echo "=============================================================="
+echo " GPU / MIG ASSIGNMENT"
+echo "=============================================================="
+# Read CUDA_VISIBLE_DEVICES straight out of each process's environment.
+# nvidia-smi's per-process view is permission-blocked on this box, but
+# /proc/<pid>/environ is not -- and this is the thing that actually decides
+# which MIG slice a process lands on. If Gemma and Svara show the same
+# value (or both show nothing), they are sharing a slice and will keep
+# competing no matter how many slices exist.
+show_gpu() {
+    local name=$1 pat=$2
+    for pid in $(pgrep -f "$pat"); do
+        local cvd
+        cvd=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+              | grep '^CUDA_VISIBLE_DEVICES=' | cut -d= -f2-)
+        if [ -z "$cvd" ]; then
+            cvd="(unset - sees ALL visible devices)"
+        fi
+        printf "  %-18s pid %-8s -> %s\n" "$name" "$pid" "$cvd"
+    done
+}
+show_gpu "gemma_server" "gemma_server.py"
+show_gpu "svara" "api/server.py"
+show_gpu "asr_api" "asr_api.py"
+echo
+echo "  Devices this container can see:"
+nvidia-smi -L 2>/dev/null | sed 's/^/    /' || echo "    (nvidia-smi -L unavailable)"
+
+echo
+echo "=============================================================="
 echo " EXPECTED"
 echo "=============================================================="
 cat <<'EOF'
