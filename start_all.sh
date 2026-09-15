@@ -23,11 +23,11 @@ SVARA_ENV="${SVARA_ENV:-svara}"
 GEMMA_ENV="${GEMMA_ENV:-gemma4-agent}"
 APP_ENV="${APP_ENV:-base}"
 
-# Per-service directories. asr_api.py is not in this repo; point ASR_DIR at
-# wherever it actually lives.
+# Per-service directories. Each service lives in its own subdirectory with
+# its own conda env; only the adapter, agent and call server run from ROOT.
 SVARA_MODEL_DIR="${SVARA_MODEL_DIR:-$ROOT/svara-tts-inference}"
 GEMMA_DIR="${GEMMA_DIR:-$ROOT/gemma4-agent}"
-ASR_DIR="${ASR_DIR:-$ROOT}"
+ASR_DIR="${ASR_DIR:-$ROOT/asr-server}"
 
 mkdir -p "$LOGDIR"
 
