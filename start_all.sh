@@ -12,7 +12,7 @@
 #   bash start_all.sh --stop    # stop everything
 #
 # Override a conda env if yours is named differently:
-#   SVARA_ENV=svara GEMMA_ENV=gemma4-agent APP_ENV=base bash start_all.sh
+#   SVARA_ENV=svara GEMMA_ENV=gemma4-agent APP_ENV=gemma4-agent bash start_all.sh
 
 set -u
 
@@ -21,7 +21,9 @@ LOGDIR="${LOGDIR:-$ROOT/logs}"
 
 SVARA_ENV="${SVARA_ENV:-svara}"
 GEMMA_ENV="${GEMMA_ENV:-gemma4-agent}"
-APP_ENV="${APP_ENV:-base}"
+# base is Python 3.8; agent_api.py uses `list[str]` annotations and needs
+# 3.9+, so the root services run under gemma4-agent (3.10).
+APP_ENV="${APP_ENV:-gemma4-agent}"
 
 # Per-service directories. Each service lives in its own subdirectory with
 # its own conda env; only the adapter, agent and call server run from ROOT.
