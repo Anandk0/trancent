@@ -60,3 +60,4 @@ parler-tts/
 -of
 test_permission.txt
 .bashrc
+logs/
