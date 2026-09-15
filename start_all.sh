@@ -85,6 +85,9 @@ start() {       # label env dir command port path timeout
 
     echo "  starting $label  (env=$env, port=$port)"
     (
+        # conda.sh dereferences PS1, which is unset in a non-interactive
+        # shell, so it aborts under `set -u` before activating anything.
+        set +u
         # shellcheck disable=SC1091
         source "$(conda info --base)/etc/profile.d/conda.sh"
         conda activate "$env" || exit 1
