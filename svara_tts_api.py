@@ -28,15 +28,26 @@ from pydantic import BaseModel
 # CONFIG
 # ============================================================
 
-# Svara model server (OpenAI-compatible speech endpoint)
-SVARA_URL = "http://127.0.0.1:8095/v1/audio/speech"
+# Svara model server (OpenAI-compatible speech endpoint).
+#
+# Configurable because Svara no longer has to be local. Running it in its
+# own pod on its own MIG slice is the point: sharing one slice with Gemma,
+# each was starving the other (Gemma 34 tok/s alone vs ~3 tok/s during a
+# call; Svara 0.96s per clause alone vs 2.6-7.8s during a call). Pointing
+# this at another host costs well under a millisecond inside the same
+# cluster -- nothing next to the seconds the contention was costing.
+#
+#   SVARA_HOST=svaara-0 python svara_tts_api.py
+SVARA_HOST = os.environ.get("SVARA_HOST", "127.0.0.1")
+SVARA_PORT = os.environ.get("SVARA_PORT", "8095")
+SVARA_URL = os.environ.get(
+    "SVARA_URL", f"http://{SVARA_HOST}:{SVARA_PORT}/v1/audio/speech"
+)
 
 HOST = os.environ.get("SVARA_ADAPTER_HOST", "0.0.0.0")
-# Moved off 8003: kokoro_server.py now owns that port (it is ~50x faster for
-# Hindi, and being non-autoregressive it stops competing with Gemma for the
-# GPU). This adapter stays running as the Kannada route and the fallback for
-# any Kokoro failure, so behaviour can never regress below today's.
-PORT = int(os.environ.get("SVARA_ADAPTER_PORT", "8007"))
+# 8003 is the port agent_api calls. Default back to it: the Kokoro swap is
+# not in place, so this adapter owns that port again.
+PORT = int(os.environ.get("SVARA_ADAPTER_PORT", "8003"))
 
 # The counselor's spoken reply is Devanagari (Hindi/Hinglish), so hi_female is
 # the default. Language routing is available if agent_api ever passes a
