@@ -24,6 +24,8 @@ import io
 import os
 import time
 
+from typing import Optional
+
 import requests
 import uvicorn
 from fastapi import FastAPI
@@ -60,8 +62,11 @@ app = FastAPI(title="TTS playground")
 
 class SpeakRequest(BaseModel):
     text: str
-    backend: str = None
-    voice: str = None
+    # Optional[...] rather than `str = None`: the page sends an explicit null
+    # for a blank voice box, and a bare `str` default rejects that as a type
+    # error before the handler ever runs.
+    backend: Optional[str] = None
+    voice: Optional[str] = None
 
 
 def _audio_seconds(audio_b64, sample_rate):
