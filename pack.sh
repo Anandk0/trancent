@@ -25,30 +25,39 @@
 
 set -euo pipefail
 
+# Always resolve to the directory containing this script, regardless of where
+# the caller ran it from. The old approach (cd dirname && zip DIR) made DIR
+# become the whole parent volume when called from ~.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${1:-$ROOT/divya-code.zip}"
 
-echo "Packing code from $ROOT -> $DEST"
+# Use an absolute path for DEST so it is findable after we cd into ROOT.
+DEST="$(cd "$(dirname "$DEST")" && pwd)/$(basename "$DEST")"
 
-cd "$(dirname "$ROOT")"
-DIR="$(basename "$ROOT")"
+echo "Packing: $ROOT"
+echo "Output:  $DEST"
+echo
 
-zip -r "$DEST" "$DIR" \
-    --exclude "$DIR/.git/*" \
-    --exclude "$DIR/__pycache__/*" \
-    --exclude "$DIR/*/__pycache__/*" \
-    --exclude "$DIR/*/*/__pycache__/*" \
-    --exclude "$DIR/*.pyc" \
-    --exclude "$DIR/*/*.pyc" \
-    --exclude "$DIR/*.egg-info/*" \
-    --exclude "$DIR/logs/*" \
-    --exclude "$DIR/parler/*" \
-    -x "*.pyc"
+# Zip from inside the trancent dir using '.', so the archive always contains
+# paths like  trancent/agent_api.py  regardless of how the script was invoked.
+cd "$ROOT"
+zip -r "$DEST" . \
+    --exclude "./.git/*" \
+    --exclude "./__pycache__/*" \
+    --exclude "./*/__pycache__/*" \
+    --exclude "./*/*/__pycache__/*" \
+    --exclude "./*.pyc" \
+    --exclude "./*/*.pyc" \
+    --exclude "./*.egg-info/*" \
+    --exclude "./logs/*" \
+    --exclude "./parler/*" \
+    --exclude "./.cache/*" \
+    --exclude "./divya-code.zip"
 
 SIZE=$(du -sh "$DEST" | awk '{print $1}')
 echo "Done: $DEST  ($SIZE)"
 echo
 echo "To unpack on the new server:"
-echo "  unzip divya-code.zip"
+echo "  unzip divya-code.zip -d trancent"
 echo "  cd trancent"
 echo "  bash install.sh"
