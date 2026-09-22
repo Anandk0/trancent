@@ -1,0 +1,43 @@
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    python3.11 python3.11-pip python3.11-dev \
+    git ffmpeg build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python3.11 -m pip install --no-cache-dir \
+    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 && \
+    python3.11 -m pip install --no-cache-dir \
+    vllm \
+    snac \
+    fastapi \
+    "uvicorn[standard]" \
+    soundfile \
+    numpy \
+    huggingface_hub
+
+# Clone the Svara inference server code.
+# Weights are NOT baked in — they live on a shared volume at
+# /root/.cache/huggingface so the 6 GB download only happens once.
+RUN git clone https://github.com/kenpath/svara-tts-v1.git /app
+
+WORKDIR /app
+
+# cuDNN is broken on some pods (driver 550.x + torch 2.7 mismatch).
+# This wrapper disables it before launching the server so SNAC falls back
+# to slower-but-working convolution kernels. On a pod where cuDNN works,
+# the disable costs ~5% throughput — acceptable insurance.
+RUN cat > /app/start.py <<'PYEOF'
+import torch
+torch.backends.cudnn.enabled = False
+import os, sys, runpy
+sys.path.insert(0, "/app/api")
+sys.path.insert(0, "/app")
+os.chdir("/app")
+sys.argv = ["api/server.py"]
+runpy.run_path("/app/api/server.py", run_name="__main__")
+PYEOF
+
+EXPOSE 8095
+CMD ["python3.11", "/app/start.py"]

@@ -1,0 +1,159 @@
+version: "3.9"
+
+# ============================================================
+# BEFORE RUNNING: fill in the two MIG UUIDs below.
+#
+# Get them with:
+#   nvidia-smi -L
+#
+# You need TWO separate MIG slices on your 141 GB GPU.
+# If you only see one (e.g. 5g.141gb), ask your admin to
+# split it into 2x 3g.71gb. Each slice appears like:
+#   MIG 3g.71gb Device 0: ... (UUID: MIG-xxxxxxxx-xxxx-...)
+#
+# Recommended split for 141 GB (H200 NVL, 7 compute units):
+#   Gemma  -> 3g.71gb  (enough for 15 GB model + 56 GB KV cache)
+#   Svara  -> 3g.71gb  (enough for 6 GB model + decode headroom)
+#   ASR    -> CPU only (no GPU slice needed)
+#
+# To create the split (run as root on the HOST, not inside container):
+#   nvidia-smi mig -cgi 3g.71gb,3g.71gb -C
+#
+# ============================================================
+
+x-mig-gemma: &mig-gemma
+  # Replace with your actual Gemma MIG UUID from nvidia-smi -L
+  MIG_GEMMA_UUID: "MIG-REPLACE-WITH-GEMMA-UUID"
+
+x-mig-svara: &mig-svara
+  # Replace with your actual Svara MIG UUID from nvidia-smi -L
+  MIG_SVARA_UUID: "MIG-REPLACE-WITH-SVARA-UUID"
+
+services:
+
+  # ----------------------------------------------------------
+  # 1. Gemma LLM  — 60-71 GB MIG slice
+  # ----------------------------------------------------------
+  gemma:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gemma
+    container_name: divya-gemma
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - NVIDIA_VISIBLE_DEVICES=${MIG_GEMMA_UUID}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - hf-cache:/root/.cache/huggingface   # shared model weight cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${MIG_GEMMA_UUID}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ----------------------------------------------------------
+  # 2. Svara TTS  — 60-71 GB MIG slice
+  # ----------------------------------------------------------
+  svara:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.svara
+    container_name: divya-svara
+    restart: unless-stopped
+    ports:
+      - "8095:8095"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${MIG_SVARA_UUID}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - VLLM_GPU_MEMORY_UTILIZATION=0.85
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${MIG_SVARA_UUID}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8095/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s   # vLLM takes ~75s to load weights
+
+  # ----------------------------------------------------------
+  # 3. ASR  — CPU only, no GPU slice needed
+  # ----------------------------------------------------------
+  asr:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.asr
+    container_name: divya-asr
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - CUDA_VISIBLE_DEVICES=""   # force CPU
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ----------------------------------------------------------
+  # 4. Agent + Call server + Svara adapter  — CPU only
+  # ----------------------------------------------------------
+  agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+    container_name: divya-agent
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+      - "8003:8003"
+      - "8080:8080"
+    environment:
+      # These point to the other containers by service name (Docker DNS).
+      # Inside the docker network, "gemma:8000" resolves automatically.
+      - GEMMA_URL=http://gemma:8000
+      - ASR_URL=http://asr:8001
+      - SVARA_URL=http://svara:8095/v1/audio/speech
+    depends_on:
+      gemma:
+        condition: service_healthy
+      svara:
+        condition: service_healthy
+      asr:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+# ----------------------------------------------------------
+# Shared HuggingFace model cache
+# Models are downloaded once into this volume (~24 GB total):
+#   google/gemma-4-E4B-it          ~15 GB
+#   ai4bharat/indic-conformer-600m ~2.4 GB
+#   kenpath/svara-tts-v1           ~6 GB
+# ----------------------------------------------------------
+volumes:
+  hf-cache:
+    driver: local

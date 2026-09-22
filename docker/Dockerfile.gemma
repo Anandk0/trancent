@@ -1,0 +1,26 @@
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y python3.10 python3-pip git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir \
+    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 && \
+    pip3 install --no-cache-dir \
+    transformers==5.16.1 \
+    accelerate \
+    fastapi \
+    "uvicorn[standard]" \
+    pydantic \
+    requests
+
+WORKDIR /app
+COPY gemma_server.py .
+
+# Model weights are NOT baked in — they live on a shared volume mounted at
+# /root/.cache/huggingface so the 15 GB download only happens once.
+# Pass HF_TOKEN at runtime if the cache is cold:
+#   docker run -e HF_TOKEN=hf_xxx ...
+
+EXPOSE 8000
+CMD ["python3", "gemma_server.py"]

@@ -1,0 +1,23 @@
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+
+# ASR runs on CPU (CUDA_VISIBLE_DEVICES="" in the server code).
+# No GPU base image needed — keeps this image small (~2 GB vs ~8 GB).
+RUN pip install --no-cache-dir \
+    torch torchaudio --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir \
+    transformers \
+    fastapi \
+    "uvicorn[standard]" \
+    numpy \
+    soundfile
+
+WORKDIR /app
+COPY asr-server/asr_api.py .
+
+# Model weights (~2.4 GB) live on the shared HF cache volume.
+
+EXPOSE 8001
+CMD ["python3", "asr_api.py"]

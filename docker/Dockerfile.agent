@@ -1,0 +1,29 @@
+FROM python:3.10-slim
+
+# No GPU needed — agent_api, call_server and svara_tts_api are pure HTTP proxies.
+RUN pip install --no-cache-dir \
+    fastapi \
+    "uvicorn[standard]" \
+    requests \
+    pydantic \
+    starlette
+
+WORKDIR /app
+COPY agent_api.py .
+COPY call_server.py .
+COPY svara_tts_api.py .
+
+# start_services.sh brings up all three in the same container since they are
+# tiny and CPU-only. They talk to the GPU containers over the Docker network.
+RUN cat > /app/start_services.sh <<'EOF'
+#!/bin/bash
+set -e
+python3 svara_tts_api.py &
+python3 agent_api.py &
+python3 call_server.py &
+wait
+EOF
+RUN chmod +x /app/start_services.sh
+
+EXPOSE 8003 8002 8080
+CMD ["/app/start_services.sh"]
